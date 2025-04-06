@@ -14,6 +14,7 @@
 #include <glm/gtc/matrix_transform.hpp>
 
 #include "Camera.hpp"
+#include "Model.hpp"
 
 int main(void)
 {
@@ -49,37 +50,20 @@ int main(void)
         std::shared_ptr<View> rtUAV = std::make_shared<View>(rtOutput, ViewType::Storage);
 
         // Create geometry
-        uint32_t indices[] = {
-            0, 1, 2
-        };
+        GLTF model;
+        model.Load("Assets/Sponza/Sponza.gltf");
 
-        glm::vec3 vertices[] = {
-            glm::vec3{  0.0f,  0.5f, 1.0f },
-            glm::vec3{  0.5f, -0.5f, 1.0f },
-            glm::vec3{ -0.5f, -0.5f, 1.0f }
-        };
+        std::vector<RaytracingInstance> instances;
+        model.TraverseNode(model.Root, [&](GLTFNode* node){
+            for (auto& primitive : node->Primitives) {
+                instances.push_back(primitive.Instance);
+            }
+        });
 
-        std::shared_ptr<Buffer> vertexBuffer = std::make_shared<Buffer>(sizeof(vertices), sizeof(glm::vec3), BufferType::Vertex, "Vertex Buffer");
-        std::shared_ptr<Buffer> indexBuffer = std::make_shared<Buffer>(sizeof(indices), sizeof(uint32_t), BufferType::Index, "Index Buffer");
+        std::shared_ptr<Buffer> instanceBuffer = std::make_shared<Buffer>(sizeof(RaytracingInstance) * instances.size(), sizeof(RaytracingInstance), BufferType::Constant, "Scene Instances");
+        instanceBuffer->CopyMapped(instances.data(), sizeof(RaytracingInstance) * instances.size());
 
-        Uploader::EnqueueBufferUpload(vertices, sizeof(vertices), vertexBuffer);
-        Uploader::EnqueueBufferUpload(indices, sizeof(indices), indexBuffer);
-        
-        // Create acceleration structures
-        std::shared_ptr<BLAS> blas = std::make_shared<BLAS>(vertexBuffer, indexBuffer, 3, 3, "BLAS");
-        Uploader::EnqueueAccelerationStructureBuild(blas);
-
-        RaytracingInstance instance = {};
-        instance.Transform = glm::identity<glm::mat3x4>();
-        instance.AccelerationStructure = blas->GetAddress();
-        instance.InstanceMask = 1;
-        instance.InstanceID = 0;
-        instance.Flags = 0;
-
-        std::shared_ptr<Buffer> instanceBuffer = std::make_shared<Buffer>(sizeof(RaytracingInstance), sizeof(RaytracingInstance), BufferType::Constant, "Scene Instances");
-        instanceBuffer->CopyMapped(&instance, sizeof(instance));
-
-        std::shared_ptr<TLAS> tlas = std::make_shared<TLAS>(instanceBuffer, 1, "Scene TLAS");
+        std::shared_ptr<TLAS> tlas = std::make_shared<TLAS>(instanceBuffer, instances.size(), "Scene TLAS");
         Uploader::EnqueueAccelerationStructureBuild(tlas);
         
         // Flush before starting
@@ -154,7 +138,6 @@ int main(void)
             frame.CommandBuffer->Barrier(frame.Backbuffer, ResourceLayout::ColorWrite);
             frame.CommandBuffer->SetRenderTargets({ frame.BackbufferView }, nullptr);
             frame.CommandBuffer->BeginGUI(frame.Width, frame.Height);
-            ImGui::ShowDemoWindow();
             frame.CommandBuffer->EndGUI();
             frame.CommandBuffer->Barrier(frame.Backbuffer, ResourceLayout::Present);
             frame.CommandBuffer->EndMarker();
