@@ -1,0 +1,11 @@
+# IDE
+.vscode
+
+# Specifics
+log.txt
+imgui.ini
+
+# Binaries
+.xmake
+build
+Other
