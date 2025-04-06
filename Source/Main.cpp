@@ -1,10 +1,5 @@
 //
 // > Notice: Amélie Heinrich @ 2025
-// > Create Time: 2025-04-06 17:21:14
-//
-
-//
-// > Notice: Amélie Heinrich @ 2025
 // > Create Time: 2025-04-06 11:14:48
 //
 
@@ -17,6 +12,8 @@
 #include <imgui.h>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+
+#include "Camera.hpp"
 
 int main(void)
 {
@@ -34,7 +31,7 @@ int main(void)
         specs.MaxRecursion = 3;
         specs.PayloadSize = sizeof(glm::vec4);
         specs.Library = file.Modules["Shader"];
-        specs.Signature = std::make_shared<RootSignature>(std::vector<RootType>{ RootType::PushConstant, RootType::ShaderResource }, sizeof(glm::ivec4));
+        specs.Signature = std::make_shared<RootSignature>(std::vector<RootType>{ RootType::PushConstant }, sizeof(glm::ivec4));
         
         std::shared_ptr<RaytracingPipeline> pipeline = std::make_shared<RaytracingPipeline>(specs);
 
@@ -57,9 +54,9 @@ int main(void)
         };
 
         glm::vec3 vertices[] = {
-            glm::vec3{  0.0f, -0.5f, 1.0f },
-            glm::vec3{ -0.5f,  0.5f, 1.0f },
-            glm::vec3{  0.5f,  0.5f, 1.0f }
+            glm::vec3{  0.0f,  0.5f, 1.0f },
+            glm::vec3{  0.5f, -0.5f, 1.0f },
+            glm::vec3{ -0.5f, -0.5f, 1.0f }
         };
 
         std::shared_ptr<Buffer> vertexBuffer = std::make_shared<Buffer>(sizeof(vertices), sizeof(glm::vec3), BufferType::Vertex, "Vertex Buffer");
@@ -87,24 +84,53 @@ int main(void)
         
         // Flush before starting
         Uploader::Flush();
-    
+
+        // Create camera constant buffer
+        std::shared_ptr<Buffer> cameraBuffer = std::make_shared<Buffer>(256, 0, BufferType::Constant, "Camera Constant Buffer");
+        cameraBuffer->BuildCBV();
+
+        // Setup timer and camera
+        float start = SDL_GetTicks();
+        Camera camera;
+
         // Main loop
         while (window->IsOpen()) {
+            // Calculate dt
+            float now = SDL_GetTicks();
+            float dt = (now - start) / 1000.0f;
+            start = now;
+
             // Begin frame
             window->Update();
             Frame frame = RHI::Begin();
             frame.CommandBuffer->Begin();
+            camera.Begin();
+
+            struct CameraData {
+                glm::mat4 invView;
+                glm::mat4 invProj;
+                glm::vec3 cameraPos;
+                int pad;
+            } camData = {
+                glm::inverse(camera.View()),
+                glm::inverse(camera.Projection()),
+                camera.Position(),
+                0
+            };
+            cameraBuffer->CopyMapped(&camData, sizeof(CameraData));
 
             // Draw triangle
             struct Data {
                 // Resources
                 int nRenderTarget;
                 int nAccel;
-                glm::ivec2 nPad;
+                int nCameraBuffer;
+                int Pad;
             } data = {
                 rtUAV->GetDescriptor().Index,
                 tlas->Bindless(),
-                glm::ivec3(0)
+                cameraBuffer->CBV(),
+                0
             };
 
             // Trace rays
@@ -113,7 +139,6 @@ int main(void)
             frame.CommandBuffer->SetViewport(0, 0, frame.Width, frame.Height);
             frame.CommandBuffer->SetRaytracingPipeline(pipeline);
             frame.CommandBuffer->ComputePushConstants(&data, sizeof(data), 0);
-            frame.CommandBuffer->BindComputeTLAS(tlas, 1);
             frame.CommandBuffer->TraceRays(frame.Width, frame.Height);
             frame.CommandBuffer->EndMarker();
 
@@ -139,6 +164,9 @@ int main(void)
             RHI::Submit({ frame.CommandBuffer });
             RHI::End();
             RHI::Present(false);
+
+            // Update camera
+            camera.Update(dt, frame.Width, frame.Height);
         }
         RHI::Wait();
     }
