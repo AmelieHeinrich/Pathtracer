@@ -8,11 +8,11 @@
 struct PushConstants
 {
     int nRenderTarget;
-    int3 nPad;
+    int nAccel;
+    int2 nPad;
 };
 
 ConstantBuffer<PushConstants> bConstants : register(b0);
-RaytracingAccelerationStructure asScene : register(b1);
 
 struct RayPayload
 {
@@ -24,6 +24,7 @@ void RayGeneration()
 {
     // Resources
     RWTexture2D<float4> tOutput = ResourceDescriptorHeap[bConstants.nRenderTarget];
+    RaytracingAccelerationStructure asScene = ResourceDescriptorHeap[bConstants.nAccel];
 
     float2 lerpValues = (float2)DispatchRaysIndex() / (float2)DispatchRaysDimensions();
 

@@ -99,9 +99,11 @@ int main(void)
             struct Data {
                 // Resources
                 int nRenderTarget;
-                glm::ivec3 nPad;
+                int nAccel;
+                glm::ivec2 nPad;
             } data = {
                 rtUAV->GetDescriptor().Index,
+                tlas->Bindless(),
                 glm::ivec3(0)
             };
 
