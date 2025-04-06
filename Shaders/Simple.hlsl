@@ -14,9 +14,9 @@ struct PushConstants
 ConstantBuffer<PushConstants> bConstants : register(b0);
 RaytracingAccelerationStructure asScene : register(b1);
 
-struct [raypayload] RayPayload
+struct RayPayload
 {
-    float4 vColor : read(caller) : write(caller);
+    float4 vColor;
 };
 
 [shader("raygeneration")]
@@ -25,23 +25,27 @@ void RayGeneration()
     // Resources
     RWTexture2D<float4> tOutput = ResourceDescriptorHeap[bConstants.nRenderTarget];
 
-    uint2 dispatchIndex = DispatchRaysIndex().xy;
+    float2 lerpValues = (float2)DispatchRaysIndex() / (float2)DispatchRaysDimensions();
 
     // Orthographic projection since we're raytracing in screen space.
     float3 vRayDir = float3(0, 0, 1);
-    float3 vOrigin = float3(dispatchIndex.x, dispatchIndex.y, 0.0f);
+    float3 vOrigin = float3(
+        lerp(-1.0f, 1.0f, lerpValues.x),
+        lerp(-1.0f, 1.0f, lerpValues.y),
+        0.0f
+    );
 
     RayDesc ray;
     ray.Origin = vOrigin;
     ray.Direction = vRayDir;
-    ray.TMin = 0.01;
+    ray.TMin = 0.001;
     ray.TMax = 10000.0;
 
     RayPayload Payload = { float4(0, 0, 0, 1) };
     TraceRay(
         asScene,
         RAY_FLAG_NONE,
-        0xFF,
+        ~0,
         0,
         0,
         0,
@@ -50,7 +54,7 @@ void RayGeneration()
     );
 
     // Write the raytraced color to the output texture.
-    tOutput[dispatchIndex] = Payload.vColor;
+    tOutput[DispatchRaysIndex().xy] = Payload.vColor;
 }
 
 [shader("closesthit")]
@@ -63,7 +67,5 @@ void ClosestHit(inout RayPayload Payload, in BuiltInTriangleIntersectionAttribut
 [shader("miss")]
 void Miss(inout RayPayload Payload)
 {
-    float slope = normalize(WorldRayDirection()).y;
-    float t = saturate(slope * 5 + 0.5);
-    Payload.vColor = float4(lerp(float3(0.75, 0.86, 0.93), float3(0.24, 0.44, 0.72), t), 1.0);
+    Payload.vColor = float4(1, 0, 1, 1);
 }

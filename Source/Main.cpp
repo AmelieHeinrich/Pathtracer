@@ -16,6 +16,7 @@
 
 #include <imgui.h>
 #include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 
 int main(void)
 {
@@ -56,9 +57,9 @@ int main(void)
         };
 
         glm::vec3 vertices[] = {
-            glm::vec3{ -0.5f, -0.5f, 0.0f },
-            glm::vec3{  0.5f, -0.5f, 0.0f },
-            glm::vec3{  0.0f,  0.5f, 0.0f }
+            glm::vec3{  0.0f, -0.5f, 1.0f },
+            glm::vec3{ -0.5f,  0.5f, 1.0f },
+            glm::vec3{  0.5f,  0.5f, 1.0f }
         };
 
         std::shared_ptr<Buffer> vertexBuffer = std::make_shared<Buffer>(sizeof(vertices), sizeof(glm::vec3), BufferType::Vertex, "Vertex Buffer");
@@ -72,10 +73,11 @@ int main(void)
         Uploader::EnqueueAccelerationStructureBuild(blas);
 
         RaytracingInstance instance = {};
-        instance.Transform = glm::mat3x4(glm::transpose(glm::mat4(1.0f)));
+        instance.Transform = glm::identity<glm::mat3x4>();
         instance.AccelerationStructure = blas->GetAddress();
         instance.InstanceMask = 1;
         instance.InstanceID = 0;
+        instance.Flags = 0;
 
         std::shared_ptr<Buffer> instanceBuffer = std::make_shared<Buffer>(sizeof(RaytracingInstance), sizeof(RaytracingInstance), BufferType::Constant, "Scene Instances");
         instanceBuffer->CopyMapped(&instance, sizeof(instance));
@@ -123,7 +125,6 @@ int main(void)
             // Draw ImGui
             frame.CommandBuffer->BeginMarker("ImGui");
             frame.CommandBuffer->Barrier(frame.Backbuffer, ResourceLayout::ColorWrite);
-            frame.CommandBuffer->ClearRenderTarget(frame.BackbufferView, 0.0f, 0.0f, 0.0f);
             frame.CommandBuffer->SetRenderTargets({ frame.BackbufferView }, nullptr);
             frame.CommandBuffer->BeginGUI(frame.Width, frame.Height);
             ImGui::ShowDemoWindow();
