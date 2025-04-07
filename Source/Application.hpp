@@ -6,8 +6,10 @@
 #pragma once
 
 #include <Oslo/Oslo.hpp>
-#include <Oslo/RHI/Uploader.hpp>
-#include <Oslo/RHI/BLAS.hpp>
+
+#include "Renderer/Renderer.hpp"
+#include "Scene.hpp"
+#include "Camera.hpp"
 
 class Application
 {
@@ -18,4 +20,10 @@ public:
     void Run();
 private:
     std::shared_ptr<Window> mWindow;
+    std::shared_ptr<Renderer> mRenderer;
+
+    Scene mScene;
+    Camera mCamera;
+
+    float mStart = 0.0f;
 };

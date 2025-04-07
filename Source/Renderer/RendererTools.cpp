@@ -91,6 +91,11 @@ void RendererTools::Init()
     }
 }
 
+void RendererTools::Free()
+{
+    sData.Resources.clear();
+}
+
 std::shared_ptr<RenderPassResource> RendererTools::CreateSharedTexture(const std::string& name, TextureDesc desc)
 {
     std::shared_ptr<RenderPassResource> resource = std::make_shared<RenderPassResource>();

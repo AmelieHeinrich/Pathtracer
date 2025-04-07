@@ -17,5 +17,4 @@ public:
 
 private:
     std::shared_ptr<RaytracingPipeline> mPipeline;
-    std::shared_ptr<Buffer> mCameraBuffer;
 };

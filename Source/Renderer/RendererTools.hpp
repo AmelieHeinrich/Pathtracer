@@ -44,6 +44,7 @@ class RendererTools
 {
 public:
     static void Init();
+    static void Free();
 
     static std::shared_ptr<RenderPassResource> CreateSharedTexture(const std::string& name, TextureDesc desc);
     static std::shared_ptr<RenderPassResource> CreateSharedRingBuffer(const std::string& name, uint64_t size, uint64_t stride = 0);

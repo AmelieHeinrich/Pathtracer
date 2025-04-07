@@ -18,6 +18,8 @@ struct CameraInfo
 
 struct Entity
 {
+    USE_TRACKING_ALLOCATOR;
+
     glm::mat4 Transform;
     GLTF Model;
 };
