@@ -15,6 +15,7 @@
 
 #include "Camera.hpp"
 #include "Model.hpp"
+#include "Scene.hpp"
 
 int main(void)
 {
@@ -50,21 +51,9 @@ int main(void)
         std::shared_ptr<View> rtUAV = std::make_shared<View>(rtOutput, ViewType::Storage);
 
         // Create geometry
-        GLTF model;
-        model.Load("Assets/Sponza/Sponza.gltf");
-
-        std::vector<RaytracingInstance> instances;
-        model.TraverseNode(model.Root, [&](GLTFNode* node){
-            for (auto& primitive : node->Primitives) {
-                instances.push_back(primitive.Instance);
-            }
-        });
-
-        std::shared_ptr<Buffer> instanceBuffer = std::make_shared<Buffer>(sizeof(RaytracingInstance) * instances.size(), sizeof(RaytracingInstance), BufferType::Constant, "Scene Instances");
-        instanceBuffer->CopyMapped(instances.data(), sizeof(RaytracingInstance) * instances.size());
-
-        std::shared_ptr<TLAS> tlas = std::make_shared<TLAS>(instanceBuffer, instances.size(), "Scene TLAS");
-        Uploader::EnqueueAccelerationStructureBuild(tlas);
+        Scene scene;
+        scene.PushEntity(glm::mat4(1.0f), "Assets/Sponza/Sponza.gltf");
+        scene.Build();
         
         // Flush before starting
         Uploader::Flush();
@@ -112,7 +101,7 @@ int main(void)
                 int Pad;
             } data = {
                 rtUAV->GetDescriptor().Index,
-                tlas->Bindless(),
+                scene.TopLevelAS->Bindless(),
                 cameraBuffer->CBV(),
                 0
             };

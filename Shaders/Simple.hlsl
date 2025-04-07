@@ -45,6 +45,17 @@ void GenerateCameraRay(uint2 index, out float3 origin, out float3 direction)
     direction = dir.xyz;
 }
 
+uint hash(uint a)
+{
+    a = (a+0x7ed55d16) + (a<<12);
+    a = (a^0xc761c23c) ^ (a>>19);
+    a = (a+0x165667b1) + (a<<5);
+    a = (a+0xd3a2646c) ^ (a<<9);
+    a = (a+0xfd7046c5) + (a<<3);
+    a = (a^0xb55a4f09) ^ (a>>16);
+    return a;
+}
+
 [shader("raygeneration")]
 void RayGeneration()
 {
@@ -83,8 +94,10 @@ void RayGeneration()
 [shader("closesthit")]
 void ClosestHit(inout RayPayload Payload, in BuiltInTriangleIntersectionAttributes Attr)
 {
-    float3 vBarycentrics = float3(1 - Attr.barycentrics.x - Attr.barycentrics.y, Attr.barycentrics.x, Attr.barycentrics.y);
-    Payload.vColor = float4(vBarycentrics, 1);
+    uint primitiveHash = hash(InstanceIndex());
+    float3 primitiveColor = float3(float(primitiveHash & 255), float((primitiveHash >> 8) & 255), float((primitiveHash >> 16) & 255)) / 255.0;
+
+    Payload.vColor = float4(primitiveColor, 1);
 }
 
 [shader("miss")]
