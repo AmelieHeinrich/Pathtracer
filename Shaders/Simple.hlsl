@@ -43,7 +43,8 @@ struct PushConstants
     int nInstanceBuffer;
 
     int nWrapSampler;
-    int3 nPad;
+    int nCubemap;
+    int2 Pad;
 };
 
 ConstantBuffer<PushConstants> bConstants : register(b0);
@@ -153,5 +154,8 @@ void ClosestHit(inout RayPayload Payload, in BuiltInTriangleIntersectionAttribut
 [shader("miss")]
 void Miss(inout RayPayload Payload)
 {
-    Payload.vColor = float4(1, 0, 1, 1);
+    SamplerState sCubeSampler = SamplerDescriptorHeap[bConstants.nWrapSampler];
+    TextureCube<float4> tEnvironment = ResourceDescriptorHeap[bConstants.nCubemap];
+
+    Payload.vColor = tEnvironment.SampleLevel(sCubeSampler, normalize(WorldRayDirection()), 0);
 }

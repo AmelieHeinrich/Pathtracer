@@ -33,6 +33,8 @@ MainPass::MainPass()
 
     RendererTools::CreateSharedRingBuffer("CameraBuffer", 256, 0);
     RendererTools::CreateSharedSampler("TextureSampler", SamplerFilter::Linear, SamplerAddress::Wrap);
+
+    mSkybox = SkyboxCooker::LoadSkybox("Assets/Skybox/Garden.hdr");
 }
 
 void MainPass::Render(Frame& frame, Scene& scene)
@@ -60,13 +62,15 @@ void MainPass::Render(Frame& frame, Scene& scene)
         int nCameraBuffer;
         int nInstanceBuffer;
         int nSampler;
-        glm::ivec3 Pad;
+        int nCubeMap;
+        glm::ivec2 Pad;
     } data = {
         out->Bindless(ViewType::Storage),
         scene.TopLevelAS->Bindless(),
         cam->Bindless(ViewType::None, frame.FrameIndex),
         scene.Resources.InstanceBuffer->SRV(),
-        sampler->Bindless()
+        sampler->Bindless(),
+        mSkybox->SkyboxCubeView->GetDescriptor().Index
     };
 
     // Trace

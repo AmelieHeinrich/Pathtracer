@@ -6,6 +6,7 @@
 #pragma once
 
 #include "Renderer/Pass.hpp"
+#include "Renderer/Skybox.hpp"
 
 class MainPass : public Pass
 {
@@ -17,4 +18,5 @@ public:
 
 private:
     std::shared_ptr<RaytracingPipeline> mPipeline;
+    std::shared_ptr<Skybox> mSkybox;
 };

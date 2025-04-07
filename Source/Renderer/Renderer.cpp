@@ -8,18 +8,22 @@
 
 #include "Cache/TextureCache.hpp"
 #include "Passes/MainPass.hpp"
+#include "Skybox.hpp"
 
 Renderer::Renderer()
 {
+    RendererTools::Init();
+    SkyboxCooker::Init();
+
     mPasses = {
         std::make_shared<MainPass>()
     };
-    RendererTools::Init();
 }
 
 Renderer::~Renderer()
 {
     mPasses.clear();
+    SkyboxCooker::Exit();
     RendererTools::Free();
     TextureCache::Clear();
 }
