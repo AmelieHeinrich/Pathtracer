@@ -19,6 +19,18 @@ struct Vertex
     glm::vec2 UV;
 };
 
+struct RaytracingMaterial
+{
+    int AlbedoIndex;
+    glm::ivec3 Pad;
+};
+
+struct GLTFMaterial
+{
+    std::shared_ptr<Texture> Albedo;
+    std::shared_ptr<View> AlbedoView;
+};
+
 struct GLTFPrimitive
 {
     std::shared_ptr<Buffer> VertexBuffer;
@@ -51,6 +63,8 @@ public:
     std::string Directory;
 
     GLTFNode* Root = nullptr;
+    std::vector<GLTFMaterial> Materials;
+    std::shared_ptr<Buffer> MaterialBuffer;
 
     uint32_t VertexCount = 0;
     uint32_t IndexCount = 0;

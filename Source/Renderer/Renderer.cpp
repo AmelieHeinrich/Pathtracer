@@ -6,6 +6,7 @@
 #include "Renderer.hpp"
 #include "RendererTools.hpp"
 
+#include "Cache/TextureCache.hpp"
 #include "Passes/MainPass.hpp"
 
 Renderer::Renderer()
@@ -20,6 +21,7 @@ Renderer::~Renderer()
 {
     mPasses.clear();
     RendererTools::Free();
+    TextureCache::Clear();
 }
 
 void Renderer::Render(Frame& frame, Scene& scene)

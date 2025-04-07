@@ -15,7 +15,7 @@ MainPass::MainPass()
     specs.MaxRecursion = 3;
     specs.PayloadSize = sizeof(glm::vec4);
     specs.Library = file.Modules["Shader"];
-    specs.Signature = std::make_shared<RootSignature>(std::vector<RootType>{RootType::PushConstant }, sizeof(glm::ivec4));
+    specs.Signature = std::make_shared<RootSignature>(std::vector<RootType>{RootType::PushConstant }, sizeof(glm::ivec4) * 2);
 
     mPipeline = std::make_shared<RaytracingPipeline>(specs);
 
@@ -32,12 +32,14 @@ MainPass::MainPass()
     tex->AddView(ViewType::Storage, ViewDimension::Texture);
 
     RendererTools::CreateSharedRingBuffer("CameraBuffer", 256, 0);
+    RendererTools::CreateSharedSampler("TextureSampler", SamplerFilter::Linear, SamplerAddress::Wrap);
 }
 
 void MainPass::Render(Frame& frame, Scene& scene)
 {
     auto out = RendererTools::Get("RTOutput");
     auto cam = RendererTools::Get("CameraBuffer");
+    auto sampler = RendererTools::Get("TextureSampler");
 
     struct CameraData {
         glm::mat4 invView;
@@ -57,11 +59,14 @@ void MainPass::Render(Frame& frame, Scene& scene)
         int nAccel;
         int nCameraBuffer;
         int nInstanceBuffer;
+        int nSampler;
+        glm::ivec3 Pad;
     } data = {
         out->Bindless(ViewType::Storage),
         scene.TopLevelAS->Bindless(),
         cam->Bindless(ViewType::None, frame.FrameIndex),
-        scene.Resources.InstanceBuffer->SRV()
+        scene.Resources.InstanceBuffer->SRV(),
+        sampler->Bindless()
     };
 
     // Trace

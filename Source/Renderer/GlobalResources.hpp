@@ -18,29 +18,18 @@ struct Instance
     int VertexBuffer;
     int IndexBuffer;
     int MaterialIndex;
-    int Pad;
-};
-
-struct Material
-{
-    int AlbedoIndex;
-    int NormalIndex;
-    int PBRIndex;
-    int Pad;
+    int MaterialBuffer;
 };
 
 class GlobalResources
 {
 public:
     std::shared_ptr<Buffer> InstanceBuffer;
-    std::shared_ptr<Buffer> MaterialBuffer;
 
     void PushModel(GLTF& gltf);
     void Build();
 private:
     std::vector<Instance> mInstances;
-    std::vector<Material> mMaterials;
     
     int mInstanceCount = 0;
-    int mMaterialCount = 0;
 };

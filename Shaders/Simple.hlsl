@@ -10,7 +10,13 @@ struct Instance
     int VertexBuffer;
     int IndexBuffer;
     int MaterialIndex;
-    int Pad;
+    int MaterialBuffer;
+};
+
+struct Material
+{
+    int AlbedoIndex;
+    int3 Pad;
 };
 
 struct Vertex
@@ -35,6 +41,9 @@ struct PushConstants
     int nAccel;
     int nCamera;
     int nInstanceBuffer;
+
+    int nWrapSampler;
+    int3 nPad;
 };
 
 ConstantBuffer<PushConstants> bConstants : register(b0);
@@ -110,8 +119,14 @@ void RayGeneration()
 void ClosestHit(inout RayPayload Payload, in BuiltInTriangleIntersectionAttributes Attr)
 {
     StructuredBuffer<Instance> bInstances = ResourceDescriptorHeap[bConstants.nInstanceBuffer];
-    
     Instance instance = bInstances[InstanceIndex()];
+    
+    StructuredBuffer<Material> bMaterials = ResourceDescriptorHeap[instance.MaterialBuffer];
+    Material material = bMaterials[instance.MaterialIndex];
+    
+    Texture2D<float4> tAlbedo = ResourceDescriptorHeap[material.AlbedoIndex];
+    SamplerState sSampler = SamplerDescriptorHeap[bConstants.nWrapSampler];
+
     StructuredBuffer<Vertex> bVertices = ResourceDescriptorHeap[instance.VertexBuffer];
     StructuredBuffer<uint> bIndices = ResourceDescriptorHeap[instance.IndexBuffer];
 
@@ -125,14 +140,14 @@ void ClosestHit(inout RayPayload Payload, in BuiltInTriangleIntersectionAttribut
     Vertex v1 = bVertices[indices.y];
     Vertex v2 = bVertices[indices.z];
 
-    float3 normal = normalize(
-        (1.0 - Attr.barycentrics.x - Attr.barycentrics.y) * v0.Normal +
-        Attr.barycentrics.x * v1.Normal +
-        Attr.barycentrics.y * v2.Normal
+    float3 bary = float3(
+        1.0 - Attr.barycentrics.x - Attr.barycentrics.y,
+        Attr.barycentrics.x,
+        Attr.barycentrics.y
     );
+    float2 uv = v0.UV * bary.x + v1.UV * bary.y + v2.UV * bary.z;
 
-    Vertex vertex = bVertices[bIndices[PrimitiveIndex()]];
-    Payload.vColor = float4(normal, 1);
+    Payload.vColor = tAlbedo.SampleLevel(sSampler, uv, 0.0);
 }
 
 [shader("miss")]

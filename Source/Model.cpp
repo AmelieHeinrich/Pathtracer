@@ -4,6 +4,7 @@
 //
 
 #include "Model.hpp"
+#include "Cache/TextureCache.hpp"
 
 #include <Oslo/Core/Assert.hpp>
 #include <Oslo/RHI/Uploader.hpp>
@@ -37,6 +38,20 @@ void GLTF::Load(const std::string& path)
 
         ProcessNode(scene->nodes[i], Root->Children[i]);
     }
+
+    // Create material buffer
+    std::vector<RaytracingMaterial> rtMaterials;
+    for (auto& material : Materials) {
+        RaytracingMaterial mat = {};
+        mat.AlbedoIndex = material.AlbedoView->GetDescriptor().Index;
+
+        rtMaterials.push_back(mat);
+    }
+
+    MaterialBuffer = std::make_shared<Buffer>(sizeof(RaytracingMaterial) * rtMaterials.size(), sizeof(RaytracingMaterial), BufferType::Storage, "Material Buffer");
+    MaterialBuffer->BuildSRV();
+
+    Uploader::EnqueueBufferUpload(rtMaterials.data(), MaterialBuffer->GetSize(), MaterialBuffer);
 }
 
 GLTF::~GLTF()
@@ -166,6 +181,22 @@ void GLTF::ProcessPrimitive(cgltf_primitive *primitive, GLTFNode *node)
     out.IndexBuffer->BuildSRV();
 
     out.GeometryStructure = std::make_shared<BLAS>(out.VertexBuffer, out.IndexBuffer, out.VertexCount, out.IndexCount, node->Name + " BLAS");
+
+    /// @note(ame): load and create textures
+    cgltf_material *material = primitive->material;
+
+    GLTFMaterial outMaterial = {};
+    out.MaterialIndex = Materials.size();
+    if (material) {
+        if (material->pbr_metallic_roughness.base_color_texture.texture) {
+            std::string path = Directory + '/' + std::string(material->pbr_metallic_roughness.base_color_texture.texture->image->uri);
+    
+            outMaterial.Albedo = TextureCache::Get(path);
+            outMaterial.AlbedoView = std::make_shared<View>(outMaterial.Albedo, ViewType::ShaderResource);
+        }
+    }
+
+    Materials.push_back(outMaterial);
 
     Uploader::EnqueueBufferUpload(vertices.data(), out.VertexBuffer->GetSize(), out.VertexBuffer);
     Uploader::EnqueueBufferUpload(indices.data(), out.IndexBuffer->GetSize(), out.IndexBuffer);
