@@ -8,7 +8,7 @@
 
 MainPass::MainPass()
 {
-    ShaderFile file = ShaderCompiler::Load("Shaders/Simple.hlsl");
+    ShaderFile file = ShaderCompiler::Load("Shaders/Raytrace.hlsl");
 
     RaytracingPipelineSpecs specs = {};
     specs.AttribSize = sizeof(glm::vec2);
