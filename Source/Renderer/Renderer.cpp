@@ -15,7 +15,7 @@ Renderer::~Renderer()
 
 }
 
-void Renderer::Render(const Scene& scene)
+void Renderer::Render(Frame& frame, Scene& scene)
 {
 
 }

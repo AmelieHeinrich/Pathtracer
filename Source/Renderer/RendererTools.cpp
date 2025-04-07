@@ -56,3 +56,85 @@ int RenderPassResource::Bindless(ViewType type, int frameIndex)
     }
     return -1;
 }
+
+RendererTools::Data RendererTools::sData;
+
+void RendererTools::Init()
+{
+    {
+        TextureDesc desc = {};
+        desc.Width = 1;
+        desc.Height = 1;
+        desc.Levels = 1;
+        desc.Depth = 1;
+        desc.Name = "White Texture";
+        desc.Format = TextureFormat::RGBA8;
+        
+        auto tex = CreateSharedTexture("WhiteTexture", desc);
+        tex->AddView(ViewType::ShaderResource, ViewDimension::Texture);
+
+        Uploader::EnqueueTextureUpload(std::vector<uint8_t>{ 0xFF, 0xFF, 0xFF, 0xFF }, tex->Texture);
+    }
+    {
+        TextureDesc desc = {};
+        desc.Width = 1;
+        desc.Height = 1;
+        desc.Levels = 1;
+        desc.Depth = 1;
+        desc.Name = "Black Texture";
+        desc.Format = TextureFormat::RGBA8;
+        
+        auto tex = CreateSharedTexture("BlackTexture", desc);
+        tex->AddView(ViewType::ShaderResource, ViewDimension::Texture);
+        
+        Uploader::EnqueueTextureUpload(std::vector<uint8_t>{ 0x00, 0x00, 0x00, 0xFF }, tex->Texture);
+    }
+}
+
+std::shared_ptr<RenderPassResource> RendererTools::CreateSharedTexture(const std::string& name, TextureDesc desc)
+{
+    std::shared_ptr<RenderPassResource> resource = std::make_shared<RenderPassResource>();
+    resource->Type = RenderPassResourceType::SharedTexture;
+    resource->Texture = std::make_shared<Texture>(desc);
+    sData.Resources[name] = resource;
+    return sData.Resources[name];
+}
+
+std::shared_ptr<RenderPassResource> RendererTools::CreateSharedRingBuffer(const std::string& name, uint64_t size, uint64_t stride)
+{
+    std::shared_ptr<RenderPassResource> resource = std::make_shared<RenderPassResource>();
+    resource->Type = RenderPassResourceType::SharedRingBuffer;
+    for (int i = 0; i < FRAMES_IN_FLIGHT; i++) {
+        resource->RBuffer[i] = std::make_shared<Buffer>(size, stride, BufferType::Constant, name + " " + std::to_string(i));
+        resource->RBuffer[i]->BuildCBV();
+        if (stride > 0)
+            resource->RBuffer[i]->BuildSRV();
+    }
+    sData.Resources[name] = resource;
+    return sData.Resources[name];
+}
+
+std::shared_ptr<RenderPassResource> RendererTools::CreateSharedRWBuffer(const std::string& name, uint64_t size, uint64_t stride)
+{
+    std::shared_ptr<RenderPassResource> resource = std::make_shared<RenderPassResource>();
+    resource->Type = RenderPassResourceType::SharedBuffer;
+    resource->Buffer = std::make_shared<Buffer>(size, stride, BufferType::Storage, name);
+    resource->Buffer->BuildSRV();
+    resource->Buffer->BuildUAV();
+    sData.Resources[name] = resource;
+    return sData.Resources[name];
+}
+
+std::shared_ptr<RenderPassResource> RendererTools::CreateSharedSampler(const std::string& name, SamplerFilter filter, SamplerAddress address, bool mips, bool comparison)
+{
+    std::shared_ptr<RenderPassResource> resource = std::make_shared<RenderPassResource>();
+    resource->Type = RenderPassResourceType::SharedSampler;
+    resource->Sampler = std::make_shared<Sampler>(address, filter, mips, 16, comparison);
+    sData.Resources[name] = resource;
+    return sData.Resources[name];
+}
+
+std::shared_ptr<RenderPassResource> RendererTools::Get(const std::string& name)
+{
+    return sData.Resources[name];
+}

@@ -51,7 +51,7 @@ public:
     static std::shared_ptr<RenderPassResource> CreateSharedSampler(const std::string& name, SamplerFilter filter, SamplerAddress address, bool mips = false, bool comparison = false);
     static std::shared_ptr<RenderPassResource> Get(const std::string& name);
 private:
-    static struct RendererToolsData {
+    static struct Data {
         std::unordered_map<std::string, std::shared_ptr<RenderPassResource>> Resources;
     } sData;
 };

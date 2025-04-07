@@ -10,6 +10,8 @@
 class MainPass : public Pass
 {
 public:
+    MainPass();
+
     void Render(Frame& frame, Scene& scene) override;
     void UI() override;
 

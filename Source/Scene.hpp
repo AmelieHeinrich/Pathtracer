@@ -9,6 +9,13 @@
 
 #include "Model.hpp"
 
+struct CameraInfo
+{
+    glm::mat4 View;
+    glm::mat4 Projection;
+    glm::vec3 Position;
+};
+
 struct Entity
 {
     glm::mat4 Transform;
@@ -25,6 +32,7 @@ public:
     Entity* PushEntity(glm::mat4 transform, const std::string& path);
 
     std::shared_ptr<TLAS> TopLevelAS;
+    CameraInfo CamInfo;
 private:
     std::vector<Entity*> Entities;
     std::vector<RaytracingInstance> Instances;
