@@ -12,7 +12,7 @@ target("Pathtracer")
     set_kind("binary")
 
     add_files("Source/**.cpp")
-    add_includedirs("Oslo")
+    add_includedirs("Oslo", "Source")
     add_deps("Oslo")
 
     before_link(function (target)
