@@ -159,8 +159,12 @@ void GLTF::ProcessPrimitive(cgltf_primitive *primitive, GLTFNode *node)
     out.IndexCount = indexCount;
 
     /// @note(ame): create buffers
-    out.VertexBuffer = std::make_shared<Buffer>(vertices.size() * sizeof(Vertex), sizeof(Vertex), BufferType::Vertex, node->Name + " Vertex Buffer");
-    out.IndexBuffer = std::make_shared<Buffer>(indices.size() * sizeof(uint32_t), sizeof(uint32_t), BufferType::Index, node->Name + " Index Buffer");
+    out.VertexBuffer = std::make_shared<Buffer>(vertices.size() * sizeof(Vertex), sizeof(Vertex), BufferType::Storage, node->Name + " Vertex Buffer");
+    out.VertexBuffer->BuildSRV();
+
+    out.IndexBuffer = std::make_shared<Buffer>(indices.size() * sizeof(uint32_t), sizeof(uint32_t), BufferType::Storage, node->Name + " Index Buffer");
+    out.IndexBuffer->BuildSRV();
+
     out.GeometryStructure = std::make_shared<BLAS>(out.VertexBuffer, out.IndexBuffer, out.VertexCount, out.IndexCount, node->Name + " BLAS");
 
     Uploader::EnqueueBufferUpload(vertices.data(), out.VertexBuffer->GetSize(), out.VertexBuffer);

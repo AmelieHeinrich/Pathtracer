@@ -5,6 +5,21 @@
 
 #pragma rt_library
 
+struct Instance
+{
+    int VertexBuffer;
+    int IndexBuffer;
+    int MaterialIndex;
+    int Pad;
+};
+
+struct Vertex
+{
+    float3 Position;
+    float3 Normal;
+    float2 UV;
+};
+
 struct Camera
 {
     column_major float4x4 InvView;
@@ -19,7 +34,7 @@ struct PushConstants
     int nRenderTarget;
     int nAccel;
     int nCamera;
-    int Pad;
+    int nInstanceBuffer;
 };
 
 ConstantBuffer<PushConstants> bConstants : register(b0);
@@ -78,7 +93,7 @@ void RayGeneration()
     RayPayload Payload = { float4(0, 0, 0, 1) };
     TraceRay(
         asScene,
-        RAY_FLAG_NONE,
+        RAY_FLAG_CULL_BACK_FACING_TRIANGLES,
         0xFF,
         0,
         0,
@@ -94,10 +109,30 @@ void RayGeneration()
 [shader("closesthit")]
 void ClosestHit(inout RayPayload Payload, in BuiltInTriangleIntersectionAttributes Attr)
 {
-    uint primitiveHash = hash(InstanceIndex());
-    float3 primitiveColor = float3(float(primitiveHash & 255), float((primitiveHash >> 8) & 255), float((primitiveHash >> 16) & 255)) / 255.0;
+    StructuredBuffer<Instance> bInstances = ResourceDescriptorHeap[bConstants.nInstanceBuffer];
+    
+    Instance instance = bInstances[InstanceIndex()];
+    StructuredBuffer<Vertex> bVertices = ResourceDescriptorHeap[instance.VertexBuffer];
+    StructuredBuffer<uint> bIndices = ResourceDescriptorHeap[instance.IndexBuffer];
 
-    Payload.vColor = float4(primitiveColor, 1);
+    uint3 indices = uint3(
+        bIndices[PrimitiveIndex() * 3 + 0],
+        bIndices[PrimitiveIndex() * 3 + 1],
+        bIndices[PrimitiveIndex() * 3 + 2]
+    );
+
+    Vertex v0 = bVertices[indices.x];
+    Vertex v1 = bVertices[indices.y];
+    Vertex v2 = bVertices[indices.z];
+
+    float3 normal = normalize(
+        (1.0 - Attr.barycentrics.x - Attr.barycentrics.y) * v0.Normal +
+        Attr.barycentrics.x * v1.Normal +
+        Attr.barycentrics.y * v2.Normal
+    );
+
+    Vertex vertex = bVertices[bIndices[PrimitiveIndex()]];
+    Payload.vColor = float4(normal, 1);
 }
 
 [shader("miss")]

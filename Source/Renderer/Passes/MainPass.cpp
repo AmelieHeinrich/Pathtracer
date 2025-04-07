@@ -56,12 +56,12 @@ void MainPass::Render(Frame& frame, Scene& scene)
         int nRenderTarget;
         int nAccel;
         int nCameraBuffer;
-        int Pad;
+        int nInstanceBuffer;
     } data = {
         out->Bindless(ViewType::Storage),
         scene.TopLevelAS->Bindless(),
         cam->Bindless(ViewType::None, frame.FrameIndex),
-        0
+        scene.Resources.InstanceBuffer->SRV()
     };
 
     // Trace

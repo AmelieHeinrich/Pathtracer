@@ -15,6 +15,8 @@ Scene::~Scene()
 
 void Scene::Build()
 {
+    Resources.Build();
+
     for (auto& entity : Entities) {
         entity->Model.TraverseNode(entity->Model.Root, [&](GLTFNode* node){
             for (auto& primitive : node->Primitives) {
@@ -38,6 +40,8 @@ Entity* Scene::PushEntity(glm::mat4 transform, const std::string& path)
     entity->Model.Load(path);
     entity->Transform = transform;
     Entities.push_back(entity);
+
+    Resources.PushModel(entity->Model);
 
     return entity;
 }

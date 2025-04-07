@@ -8,6 +8,7 @@
 #include <Oslo/Oslo.hpp>
 
 #include "Model.hpp"
+#include "Renderer/GlobalResources.hpp"
 
 struct CameraInfo
 {
@@ -34,6 +35,7 @@ public:
     Entity* PushEntity(glm::mat4 transform, const std::string& path);
 
     std::shared_ptr<TLAS> TopLevelAS;
+    GlobalResources Resources;
     CameraInfo CamInfo;
 private:
     std::vector<Entity*> Entities;
