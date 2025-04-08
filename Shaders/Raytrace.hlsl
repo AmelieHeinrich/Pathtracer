@@ -70,17 +70,6 @@ void GenerateCameraRay(uint2 index, out float3 origin, out float3 direction)
     direction = dir.xyz;
 }
 
-uint hash(uint a)
-{
-    a = (a+0x7ed55d16) + (a<<12);
-    a = (a^0xc761c23c) ^ (a>>19);
-    a = (a+0x165667b1) + (a<<5);
-    a = (a+0xd3a2646c) ^ (a<<9);
-    a = (a+0xfd7046c5) + (a<<3);
-    a = (a^0xb55a4f09) ^ (a>>16);
-    return a;
-}
-
 [shader("raygeneration")]
 void RayGeneration()
 {
@@ -147,6 +136,11 @@ void ClosestHit(inout RayPayload Payload, in BuiltInTriangleIntersectionAttribut
         Attr.barycentrics.y
     );
     float2 uv = v0.UV * bary.x + v1.UV * bary.y + v2.UV * bary.z;
+    float3 normal = normalize(
+        (1.0 - Attr.barycentrics.x - Attr.barycentrics.y) * v0.Normal +
+        Attr.barycentrics.x * v1.Normal +
+        Attr.barycentrics.y * v2.Normal
+    );
 
     Payload.vColor = tAlbedo.SampleLevel(sSampler, uv, 0.0);
 }
