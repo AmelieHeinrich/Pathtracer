@@ -12,12 +12,7 @@
 #include <glm/glm.hpp>
 #include <functional>
 
-struct Vertex
-{
-    glm::vec3 Position;
-    glm::vec3 Normal;
-    glm::vec2 UV;
-};
+#include "Util/TangentCalculator.hpp"
 
 struct RaytracingMaterial
 {

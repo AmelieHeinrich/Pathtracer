@@ -13,7 +13,7 @@ MainPass::MainPass()
     RaytracingPipelineSpecs specs = {};
     specs.AttribSize = sizeof(glm::vec2);
     specs.MaxRecursion = 3;
-    specs.PayloadSize = sizeof(glm::vec4);
+    specs.PayloadSize = sizeof(glm::vec3) * + sizeof(glm::vec2) + sizeof(bool);
     specs.Library = file.Modules["Shader"];
     specs.Signature = std::make_shared<RootSignature>(std::vector<RootType>{RootType::PushConstant }, sizeof(glm::ivec4) * 2);
 

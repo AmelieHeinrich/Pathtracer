@@ -5,15 +5,15 @@
 
 add_rules("mode.debug", "mode.release", "mode.releasedbg")
 
-includes("Oslo")
+includes("Oslo", "External")
 
 target("Pathtracer")
     set_rundir(".")
     set_kind("binary")
 
     add_files("Source/**.cpp")
-    add_includedirs("Oslo", "Source")
-    add_deps("Oslo")
+    add_includedirs("Oslo", "Source", "External")
+    add_deps("Oslo", "mikktspace")
 
     before_link(function (target)
         os.cp("Oslo/Binaries/*", "$(buildir)/$(plat)/$(arch)/$(mode)/")

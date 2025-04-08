@@ -3,6 +3,8 @@
 // > Create Time: 2025-04-06 17:46:26
 //
 
+#include "Shaders/Random.hlsl"
+
 #pragma rt_library
 
 struct Instance
@@ -24,6 +26,8 @@ struct Vertex
     float3 Position;
     float3 Normal;
     float2 UV;
+    float3 Tangent;
+    float3 Bitangent;
 };
 
 struct Camera
@@ -51,8 +55,33 @@ ConstantBuffer<PushConstants> bConstants : register(b0);
 
 struct RayPayload
 {
-    float4 vColor;
+    float3 Origin;
+    float3 Dir;
+    float3 Radiance;
+    float3 Irradiance;
+
+    float Seed;
+    int Bounce;
+    bool Alive;
 };
+
+void CreateOrthonormalBasis(float3 n, out float3 t, out float3 b)
+{
+    if (abs(n.z) < 0.999f) {
+        t = normalize(cross(float3(0, 0, 1), n));
+    } else {
+        t = normalize(cross(float3(0, 1, 0), n));
+    }
+    b = cross(n, t);
+}
+
+float3 CosineSampleHemisphere(float2 xi)
+{
+    float phi = 2.0 * 3.14159 * xi.x;
+    float cosTheta = sqrt(1.0 - xi.y);
+    float sinTheta = sqrt(xi.y);
+    return float3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
+}
 
 void GenerateCameraRay(uint2 index, out float3 origin, out float3 direction)
 {
@@ -89,25 +118,50 @@ void RayGeneration()
     ray.TMin = 0.001;
     ray.TMax = 1000.0;
 
-    RayPayload Payload = { float4(0, 0, 0, 1) };
-    TraceRay(
-        asScene,
-        RAY_FLAG_CULL_BACK_FACING_TRIANGLES,
-        0xFF,
-        0,
-        0,
-        0,
-        ray,
-        Payload
-    );
+    float3 accumulatedRadiance = float3(0, 0, 0);
+    float3 irradiance = float3(1, 1, 1);
+
+    uint maxBounces = 10;
+    for (uint i = 0; i < maxBounces; i++) {
+        RayPayload payload = (RayPayload)0;
+        payload.Dir = ray.Direction;
+        payload.Origin = ray.Origin;
+        payload.Radiance = float3(0, 0, 0);
+        payload.Irradiance = irradiance;
+        payload.Seed = dot(float2(index), float2(12.9898, 78.233)) + i * 43758.5453;
+        payload.Alive = true;
+        payload.Bounce = i;
+
+        TraceRay(
+            asScene,
+            RAY_FLAG_CULL_BACK_FACING_TRIANGLES,
+            0xFF,
+            0,
+            0,
+            0,
+            ray,
+            payload
+        );
+
+        accumulatedRadiance += payload.Radiance;
+        irradiance = payload.Irradiance;
+
+        if (!payload.Alive)
+            break;
+
+        ray.Origin = payload.Origin;
+        ray.Direction = payload.Dir;
+    }
 
     // Write the raytraced color to the output texture.
-    tOutput[DispatchRaysIndex().xy] = Payload.vColor;
+    tOutput[DispatchRaysIndex().xy] = float4(accumulatedRadiance, 1);
 }
 
 [shader("closesthit")]
 void ClosestHit(inout RayPayload Payload, in BuiltInTriangleIntersectionAttributes Attr)
 {
+    RaytracingAccelerationStructure asScene = ResourceDescriptorHeap[bConstants.nAccel];
+
     StructuredBuffer<Instance> bInstances = ResourceDescriptorHeap[bConstants.nInstanceBuffer];
     Instance instance = bInstances[InstanceIndex()];
     
@@ -141,8 +195,25 @@ void ClosestHit(inout RayPayload Payload, in BuiltInTriangleIntersectionAttribut
         Attr.barycentrics.x * v1.Normal +
         Attr.barycentrics.y * v2.Normal
     );
+    float3 albedo = tAlbedo.SampleLevel(sSampler, uv, 0.0).rgb;
 
-    Payload.vColor = tAlbedo.SampleLevel(sSampler, uv, 0.0);
+    // Shade
+    float3 sunDirection = normalize(float3(0, 1, 0));
+    float3 sunColor = float3(1, 1, 1);
+    float3 radiance = sunColor * max(dot(normal, sunDirection), 0.0);
+    float3 f_r = albedo / 3.14159;
+
+    float2 xi = float2(random(Payload.Seed), random(Payload.Seed * 2));
+    float3 localDir = CosineSampleHemisphere(xi);
+    float3 newDir = normalize(localDir);
+
+    float cosTheta = dot(normal, localDir);
+    float pdf = cosTheta / 3.14159;
+
+    Payload.Irradiance *= f_r * cosTheta / pdf;
+    Payload.Radiance = radiance * f_r;
+    Payload.Origin = WorldRayOrigin() + RayTCurrent() * WorldRayDirection();
+    Payload.Dir = newDir;
 }
 
 [shader("miss")]
@@ -151,5 +222,6 @@ void Miss(inout RayPayload Payload)
     SamplerState sCubeSampler = SamplerDescriptorHeap[bConstants.nWrapSampler];
     TextureCube<float4> tEnvironment = ResourceDescriptorHeap[bConstants.nCubemap];
 
-    Payload.vColor = tEnvironment.SampleLevel(sCubeSampler, normalize(WorldRayDirection()), 0);
+    Payload.Radiance = tEnvironment.SampleLevel(sCubeSampler, normalize(WorldRayDirection()), 0).rgb;
+    Payload.Alive = false;
 }
