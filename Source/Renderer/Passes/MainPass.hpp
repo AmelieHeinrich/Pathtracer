@@ -19,4 +19,7 @@ public:
 private:
     std::shared_ptr<RaytracingPipeline> mPipeline;
     std::shared_ptr<Skybox> mSkybox;
+
+    int mFrameIndex = 0;
+    int mSamplesPerPixel = 10;
 };

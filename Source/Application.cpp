@@ -5,6 +5,8 @@
 
 #include "Application.hpp"
 
+#include <imgui.h>
+
 Application::Application()
 {
     mStart = SDL_GetTicks();
@@ -52,7 +54,7 @@ void Application::Run()
         frame.CommandBuffer->Barrier(frame.Backbuffer, ResourceLayout::ColorWrite);
         frame.CommandBuffer->SetRenderTargets({ frame.BackbufferView }, nullptr);
         frame.CommandBuffer->BeginGUI(frame.Width, frame.Height);
-        mRenderer->UI();
+        UI();
         frame.CommandBuffer->EndGUI();
         frame.CommandBuffer->Barrier(frame.Backbuffer, ResourceLayout::Present);
         frame.CommandBuffer->EndMarker();
@@ -64,7 +66,40 @@ void Application::Run()
         RHI::Present(false);
     
         // Update camera
-        mCamera.Update(dt, frame.Width, frame.Height);
+        if (mInputCamera) {
+            mCamera.Update(dt, frame.Width, frame.Height);
+        }
     }
     RHI::Wait();
+}
+
+void Application::UI()
+{
+    static bool p_open = true;
+
+    ImGuiIO& io = ImGui::GetIO();
+    ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoDocking;
+    const float PAD = 10.0f;
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImVec2 work_pos = viewport->WorkPos;
+    ImVec2 work_size = viewport->WorkSize;
+    ImVec2 window_pos, window_pos_pivot;
+    window_pos.x = (work_pos.x + PAD);
+    window_pos.y = (work_pos.y + PAD);
+    window_pos_pivot.x = 0.0f;
+    window_pos_pivot.y = 0.0f;
+    ImGui::SetNextWindowPos(window_pos, ImGuiCond_Always, window_pos_pivot);
+    window_flags |= ImGuiWindowFlags_NoMove;
+
+    ImGui::SetNextWindowBgAlpha(0.70f);
+    ImGui::Begin("Example: Simple overlay", &p_open, window_flags);
+    ImGui::Text("Pathtracer : a DXR pathtracer by Amélie Heinrich");
+    ImGui::Text("GPU: %s", RHI::GetDevice()->GetDeviceName().c_str());
+    ImGui::Separator();
+
+    mRenderer->UI();
+
+    mInputCamera = !ImGui::IsWindowFocused();
+
+    ImGui::End();
 }

@@ -6,6 +6,8 @@
 #include "MainPass.hpp"
 #include "Renderer/RendererTools.hpp"
 
+#include <imgui.h>
+
 MainPass::MainPass()
 {
     ShaderFile file = ShaderCompiler::Load("Shaders/Raytrace.hlsl");
@@ -63,14 +65,17 @@ void MainPass::Render(Frame& frame, Scene& scene)
         int nInstanceBuffer;
         int nSampler;
         int nCubeMap;
-        glm::ivec2 Pad;
+        int nFrameIndex;
+        int nSamplesPerPixel;
     } data = {
         out->Bindless(ViewType::Storage),
         scene.TopLevelAS->Bindless(),
         cam->Bindless(ViewType::None, frame.FrameIndex),
         scene.Resources.InstanceBuffer->SRV(),
         sampler->Bindless(),
-        mSkybox->SkyboxCubeView->GetDescriptor().Index
+        mSkybox->SkyboxCubeView->GetDescriptor().Index,
+        mFrameIndex,
+        mSamplesPerPixel
     };
 
     // Trace
@@ -88,9 +93,11 @@ void MainPass::Render(Frame& frame, Scene& scene)
     frame.CommandBuffer->Barrier(frame.Backbuffer, ResourceLayout::CopyDest);
     frame.CommandBuffer->CopyTextureToTexture(frame.Backbuffer, out->Texture);
     frame.CommandBuffer->EndMarker();
+
+    mFrameIndex++;
 }
 
 void MainPass::UI()
 {
-
+    ImGui::SliderInt("Samples Per Pixel", &mSamplesPerPixel, 1, 50);
 }

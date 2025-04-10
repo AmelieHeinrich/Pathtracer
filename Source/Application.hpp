@@ -19,6 +19,8 @@ public:
     
     void Run();
 private:
+    void UI();
+
     std::shared_ptr<Window> mWindow;
     std::shared_ptr<Renderer> mRenderer;
 
@@ -26,4 +28,5 @@ private:
     Camera mCamera;
 
     float mStart = 0.0f;
+    bool mInputCamera = true;
 };
