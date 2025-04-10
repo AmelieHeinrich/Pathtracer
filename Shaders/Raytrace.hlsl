@@ -50,13 +50,23 @@ struct PushConstants
     int nCubemap;
     int nFrameIndex;
     int nSamplesPerPixel;
+
+    int nBouncePerRay;
+    int3 Pad;
 };
 
 ConstantBuffer<PushConstants> bConstants : register(b0);
 
 struct RayPayload
 {
-    float4 Color;
+    float3 Throughput;
+    float3 AccumulatedColor;
+
+    int Bounce;
+    float3 NewDirection;
+    float3 NewOrigin;
+
+    RNG rng;
 };
 
 [shader("raygeneration")]
@@ -71,12 +81,13 @@ void RayGeneration()
     uint2 dimensions = DispatchRaysDimensions().xy;
 
     float4 pixelColor = 0;
-    RNG rng = rng_init(index, bConstants.nFrameIndex);
+    RayPayload payload = (RayPayload)0;
+    payload.rng = rng_init(index, bConstants.nFrameIndex);
 
     uint samplesPerPixel = bConstants.nSamplesPerPixel;
     for (uint sample = 0; sample < samplesPerPixel; sample++) {
         // Generate ray
-        float2 offset = float2(next_float(rng) - 0.5, next_float(rng) - 0.5);
+        float2 offset = float2(next_float(payload.rng) - 0.5, next_float(payload.rng) - 0.5);
 
         float3 vOrigin = 0.0;
         float3 vDirection = 0.0;
@@ -90,28 +101,37 @@ void RayGeneration()
         vDirection = mul(Matrices.InvView, float4(normalize(target.xyz), 0)).xyz;
 
         RayDesc ray;
-        ray.Origin = vOrigin;
-        ray.Direction = vDirection;
         ray.TMin = 0.001;
         ray.TMax = 1000.0;
 
-        RayPayload payload = (RayPayload)0;
-        payload.Color = 0;
+        ray.Origin = vOrigin;
+        ray.Direction = vDirection;
+
+        payload.Throughput = 1.0;
+        payload.AccumulatedColor = 0;
+        payload.NewOrigin = vOrigin;
+        payload.NewDirection = vDirection;
 
         // Trace
-        TraceRay(
-            asScene,
-            RAY_FLAG_CULL_BACK_FACING_TRIANGLES,
-            0xFF,
-            0,
-            0,
-            0,
-            ray,
-            payload
-        );
+        for (int bounce = 0; bounce < bConstants.nBouncePerRay; bounce++) {
+            payload.Bounce = bounce;
+            TraceRay(
+                asScene,
+                RAY_FLAG_CULL_BACK_FACING_TRIANGLES,
+                0xFF,
+                0,
+                0,
+                0,
+                ray,
+                payload
+            );
+
+            ray.Origin = payload.NewOrigin;
+            ray.Direction = payload.NewDirection;
+        }
 
         // Accumumate!
-        pixelColor += payload.Color;
+        pixelColor += float4(payload.AccumulatedColor, 1.0);
     }
 
     // Write the raytraced color to the output texture.
@@ -154,10 +174,26 @@ void ClosestHit(inout RayPayload Payload, in BuiltInTriangleIntersectionAttribut
         Attr.barycentrics.x * v1.Normal +
         Attr.barycentrics.y * v2.Normal
     );
-    float4 albedo = tAlbedo.SampleLevel(sSampler, uv, 0.0);
+    float3 albedo = tAlbedo.SampleLevel(sSampler, uv, 0.0).rgb;
 
+    // Set new dir
+    float3 direction = next_unit_on_hemisphere(Payload.rng, normal);
+    Payload.NewDirection = direction;
+    Payload.NewOrigin = (WorldRayOrigin() + RayTCurrent() * WorldRayDirection()) + (normal * 0.001);
+    
     // Shade
-    Payload.Color = albedo;
+    Payload.Throughput *= (albedo / 3.14159);
+    Payload.AccumulatedColor += Payload.Throughput * 0; // No radiance
+}
+
+[shader("miss")]
+void Miss(inout RayPayload Payload)
+{
+    SamplerState sCubeSampler = SamplerDescriptorHeap[bConstants.nWrapSampler];
+    TextureCube<float4> tEnvironment = ResourceDescriptorHeap[bConstants.nCubemap];
+
+    Payload.Throughput *= tEnvironment.SampleLevel(sCubeSampler, normalize(WorldRayDirection()), 0).rgb;
+    Payload.AccumulatedColor += Payload.Throughput * tEnvironment.SampleLevel(sCubeSampler, normalize(WorldRayDirection()), 0).rgb;
 }
 
 [shader("anyhit")]
@@ -200,13 +236,4 @@ void AnyHit(inout RayPayload Payload, in BuiltInTriangleIntersectionAttributes A
     float4 albedo = tAlbedo.SampleLevel(sSampler, uv, 0.0);
     if (albedo.a < 0.5)
         IgnoreHit();
-}
-
-[shader("miss")]
-void Miss(inout RayPayload Payload)
-{
-    SamplerState sCubeSampler = SamplerDescriptorHeap[bConstants.nWrapSampler];
-    TextureCube<float4> tEnvironment = ResourceDescriptorHeap[bConstants.nCubemap];
-
-    Payload.Color = tEnvironment.SampleLevel(sCubeSampler, normalize(WorldRayDirection()), 0);
 }

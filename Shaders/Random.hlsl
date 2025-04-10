@@ -75,3 +75,23 @@ float3 next_vec3(inout RNG rng)
 {
     return float3(next_float(rng), next_float(rng), next_float(rng));
 }
+
+float3 next_unit_vector(inout RNG rng)
+{
+    while (true) {
+        float3 vec = next_vec3(rng);
+        vec = vec * 2.0 - 1.0;
+        float lensq = length(vec) * length(vec);
+        if (1e-160 < lensq && lensq <= 1) {
+            return vec / sqrt(lensq);
+        }
+    }
+}
+
+float3 next_unit_on_hemisphere(inout RNG rng, float3 normal)
+{
+    float3 onUnitSphere = next_unit_vector(rng);
+    if (dot(onUnitSphere, normal) > 0.0)
+        return onUnitSphere;
+    return -onUnitSphere;
+}

@@ -8,6 +8,18 @@
 
 #include <imgui.h>
 
+struct RayPayload
+{
+    glm::vec3 Throughput;
+    glm::vec3 AccumulatedColor;
+
+    int Bounce;
+    glm::vec3 NewDirection;
+    glm::vec3 NewOrigin;
+
+    glm::uvec2 rng;
+};
+
 MainPass::MainPass()
 {
     ShaderFile file = ShaderCompiler::Load("Shaders/Raytrace.hlsl");
@@ -15,9 +27,9 @@ MainPass::MainPass()
     RaytracingPipelineSpecs specs = {};
     specs.AttribSize = sizeof(glm::vec2);
     specs.MaxRecursion = 3;
-    specs.PayloadSize = sizeof(glm::vec4);
+    specs.PayloadSize = sizeof(RayPayload);
     specs.Library = file.Modules["Shader"];
-    specs.Signature = std::make_shared<RootSignature>(std::vector<RootType>{RootType::PushConstant }, sizeof(glm::ivec4) * 2);
+    specs.Signature = std::make_shared<RootSignature>(std::vector<RootType>{RootType::PushConstant }, sizeof(glm::ivec4) * 3);
 
     mPipeline = std::make_shared<RaytracingPipeline>(specs);
 
@@ -67,6 +79,8 @@ void MainPass::Render(Frame& frame, Scene& scene)
         int nCubeMap;
         int nFrameIndex;
         int nSamplesPerPixel;
+        int nBouncesPerRay;
+        glm::ivec3 Pad;
     } data = {
         out->Bindless(ViewType::Storage),
         scene.TopLevelAS->Bindless(),
@@ -75,7 +89,8 @@ void MainPass::Render(Frame& frame, Scene& scene)
         sampler->Bindless(),
         mSkybox->SkyboxCubeView->GetDescriptor().Index,
         mFrameIndex,
-        mSamplesPerPixel
+        mSamplesPerPixel,
+        mBouncesPerRay
     };
 
     // Trace
@@ -100,4 +115,5 @@ void MainPass::Render(Frame& frame, Scene& scene)
 void MainPass::UI()
 {
     ImGui::SliderInt("Samples Per Pixel", &mSamplesPerPixel, 1, 50);
+    ImGui::SliderInt("Bounces Per Ray", &mBouncesPerRay, 1, 50);
 }

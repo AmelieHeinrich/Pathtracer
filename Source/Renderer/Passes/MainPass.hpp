@@ -21,5 +21,6 @@ private:
     std::shared_ptr<Skybox> mSkybox;
 
     int mFrameIndex = 0;
-    int mSamplesPerPixel = 10;
+    int mSamplesPerPixel = 1;
+    int mBouncesPerRay = 5;
 };
