@@ -5,6 +5,7 @@
 
 #include "Model.hpp"
 #include "Cache/TextureCache.hpp"
+#include "Renderer/RendererTools.hpp"
 
 #include <Oslo/Core/Assert.hpp>
 #include <Oslo/RHI/Uploader.hpp>
@@ -193,9 +194,15 @@ void GLTF::ProcessPrimitive(cgltf_primitive *primitive, GLTFNode *node)
     
             outMaterial.Albedo = TextureCache::Get(path);
             outMaterial.AlbedoView = std::make_shared<View>(outMaterial.Albedo, ViewType::ShaderResource);
+        } else {
+            outMaterial.Albedo = RendererTools::Get("BlackTexture")->Texture;
+            outMaterial.AlbedoView = RendererTools::Get("BlackTexture")->GetView(ViewType::ShaderResource);
         }
 
         outMaterial.AlphaTested = (material->alpha_mode != cgltf_alpha_mode_opaque);
+    } else {
+        outMaterial.Albedo = RendererTools::Get("BlackTexture")->Texture;
+        outMaterial.AlbedoView = RendererTools::Get("BlackTexture")->GetView(ViewType::ShaderResource);
     }
 
     Materials.push_back(outMaterial);

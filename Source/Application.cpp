@@ -16,7 +16,7 @@ Application::Application()
 
     mRenderer = std::make_shared<Renderer>();
 
-    mScene.PushEntity(glm::mat4(1.0f), "Assets/SimpleTest/Simple.gltf");
+    mScene.PushEntity(glm::mat4(1.0f), "Assets/Sponza/Sponza.gltf");
     mScene.Build();
 
     Uploader::Flush();

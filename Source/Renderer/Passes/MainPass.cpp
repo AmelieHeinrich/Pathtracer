@@ -14,6 +14,7 @@ struct RayPayload
     glm::vec3 AccumulatedColor;
 
     int Bounce;
+    bool Alive;
     glm::vec3 NewDirection;
     glm::vec3 NewOrigin;
 

@@ -63,6 +63,7 @@ struct RayPayload
     float3 AccumulatedColor;
 
     int Bounce;
+    bool Alive;
     float3 NewDirection;
     float3 NewOrigin;
 
@@ -83,6 +84,7 @@ void RayGeneration()
     float4 pixelColor = 0;
     RayPayload payload = (RayPayload)0;
     payload.rng = rng_init(index, bConstants.nFrameIndex);
+    payload.Alive = true;
 
     uint samplesPerPixel = bConstants.nSamplesPerPixel;
     for (uint sample = 0; sample < samplesPerPixel; sample++) {
@@ -125,6 +127,9 @@ void RayGeneration()
                 ray,
                 payload
             );
+            if (!payload.Alive) {
+                break;
+            }
 
             ray.Origin = payload.NewOrigin;
             ray.Direction = payload.NewDirection;
@@ -192,8 +197,8 @@ void Miss(inout RayPayload Payload)
     SamplerState sCubeSampler = SamplerDescriptorHeap[bConstants.nWrapSampler];
     TextureCube<float4> tEnvironment = ResourceDescriptorHeap[bConstants.nCubemap];
 
-    Payload.Throughput *= tEnvironment.SampleLevel(sCubeSampler, normalize(WorldRayDirection()), 0).rgb;
     Payload.AccumulatedColor += Payload.Throughput * tEnvironment.SampleLevel(sCubeSampler, normalize(WorldRayDirection()), 0).rgb;
+    Payload.Alive = false;
 }
 
 [shader("anyhit")]

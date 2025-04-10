@@ -25,7 +25,7 @@ struct GLTFMaterial
     std::shared_ptr<Texture> Albedo;
     std::shared_ptr<View> AlbedoView;
 
-    bool AlphaTested;
+    bool AlphaTested = false;
 };
 
 struct GLTFPrimitive
