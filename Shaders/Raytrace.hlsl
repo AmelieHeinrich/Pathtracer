@@ -82,12 +82,16 @@ void RayGeneration()
     uint2 dimensions = DispatchRaysDimensions().xy;
 
     float4 pixelColor = 0;
-    RayPayload payload = (RayPayload)0;
-    payload.rng = rng_init(index, bConstants.nFrameIndex);
-    payload.Alive = true;
 
     uint samplesPerPixel = bConstants.nSamplesPerPixel;
     for (uint sample = 0; sample < samplesPerPixel; sample++) {
+        // Generate RNG and payload
+        RayPayload payload = (RayPayload)0;
+        payload.rng = rng_init(index, bConstants.nFrameIndex * 7919 + sample * 104729); // better variation
+        payload.Alive = true;
+        payload.Throughput = 1.0;
+        payload.AccumulatedColor = 0;
+
         // Generate ray
         float2 offset = float2(next_float(payload.rng) - 0.5, next_float(payload.rng) - 0.5);
 
@@ -109,13 +113,15 @@ void RayGeneration()
         ray.Origin = vOrigin;
         ray.Direction = vDirection;
 
-        payload.Throughput = 1.0;
-        payload.AccumulatedColor = 0;
         payload.NewOrigin = vOrigin;
         payload.NewDirection = vDirection;
 
-        // Trace
+        // Trace bounces
         for (int bounce = 0; bounce < bConstants.nBouncePerRay; bounce++) {
+            if (!payload.Alive) {
+                break;
+            }
+
             payload.Bounce = bounce;
             TraceRay(
                 asScene,
@@ -127,20 +133,15 @@ void RayGeneration()
                 ray,
                 payload
             );
-            if (!payload.Alive) {
-                break;
-            }
 
             ray.Origin = payload.NewOrigin;
             ray.Direction = payload.NewDirection;
         }
 
-        // Accumumate!
         pixelColor += float4(payload.AccumulatedColor, 1.0);
     }
 
-    // Write the raytraced color to the output texture.
-    tOutput[DispatchRaysIndex().xy] = pixelColor * (1.0 / samplesPerPixel);
+    tOutput[index] = pixelColor / samplesPerPixel;
 }
 
 [shader("closesthit")]
@@ -187,7 +188,11 @@ void ClosestHit(inout RayPayload Payload, in BuiltInTriangleIntersectionAttribut
     Payload.NewOrigin = (WorldRayOrigin() + RayTCurrent() * WorldRayDirection()) + (normal * 0.001);
     
     // Shade
-    Payload.Throughput *= (albedo / 3.14159);
+    float cosTheta = dot(normal, direction);
+    float pdf = cosTheta / 3.14159;
+    float3 f_r = albedo / 3.14159;
+    
+    Payload.Throughput *= f_r * cosTheta / pdf;
     Payload.AccumulatedColor += Payload.Throughput * 0; // No radiance
 }
 

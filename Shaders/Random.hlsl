@@ -78,14 +78,11 @@ float3 next_vec3(inout RNG rng)
 
 float3 next_unit_vector(inout RNG rng)
 {
-    while (true) {
-        float3 vec = next_vec3(rng);
-        vec = vec * 2.0 - 1.0;
-        float lensq = length(vec) * length(vec);
-        if (1e-160 < lensq && lensq <= 1) {
-            return vec / sqrt(lensq);
-        }
-    }
+    float z = 1.0 - 2.0 * next_float(rng);
+    float phi = 2.0 * 3.14159 * next_float(rng);
+    float r = sqrt(1.0 - z * z);
+
+    return float3(r * cos(phi), r * sin(phi), z);
 }
 
 float3 next_unit_on_hemisphere(inout RNG rng, float3 normal)
