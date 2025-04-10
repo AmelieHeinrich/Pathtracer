@@ -89,7 +89,7 @@ void MainPass::Render(Frame& frame, Scene& scene)
         scene.Resources.InstanceBuffer->SRV(),
         sampler->Bindless(),
         mSkybox->SkyboxCubeView->GetDescriptor().Index,
-        mFrameIndex,
+        static_cast<int>(frame.FrameCount),
         mSamplesPerPixel,
         mBouncesPerRay
     };
@@ -109,8 +109,6 @@ void MainPass::Render(Frame& frame, Scene& scene)
     frame.CommandBuffer->Barrier(frame.Backbuffer, ResourceLayout::CopyDest);
     frame.CommandBuffer->CopyTextureToTexture(frame.Backbuffer, out->Texture);
     frame.CommandBuffer->EndMarker();
-
-    mFrameIndex++;
 }
 
 void MainPass::UI()
