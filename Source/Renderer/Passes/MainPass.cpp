@@ -5,6 +5,7 @@
 
 #include "MainPass.hpp"
 #include "Renderer/RendererTools.hpp"
+#include "Application.hpp"
 
 #include <imgui.h>
 
@@ -35,16 +36,17 @@ MainPass::MainPass()
     mPipeline = std::make_shared<RaytracingPipeline>(specs);
 
     TextureDesc desc = {};
-    desc.Width = 1280;
-    desc.Height = 720;
+    desc.Width = WIDTH;
+    desc.Height = HEIGHT;
     desc.Depth = 1;
     desc.Levels = 1;
-    desc.Usage = TextureUsage::Storage;
-    desc.Format = TextureFormat::RGBA8;
+    desc.Usage = TextureUsage::Storage | TextureUsage::ShaderResource;
+    desc.Format = TextureFormat::RGBA16Float;
     desc.Name = "RT Output";
 
     auto tex = RendererTools::CreateSharedTexture("RTOutput", desc);
     tex->AddView(ViewType::Storage, ViewDimension::Texture);
+    tex->AddView(ViewType::ShaderResource, ViewDimension::Texture);
 
     RendererTools::CreateSharedRingBuffer("CameraBuffer", 256, 0);
     RendererTools::CreateSharedSampler("TextureSampler", SamplerFilter::Linear, SamplerAddress::Wrap);
@@ -102,17 +104,19 @@ void MainPass::Render(Frame& frame, Scene& scene)
     frame.CommandBuffer->ComputePushConstants(&data, sizeof(data), 0);
     frame.CommandBuffer->TraceRays(frame.Width, frame.Height);
     frame.CommandBuffer->EndMarker();
-
-    // Copy to backbuffer
-    frame.CommandBuffer->BeginMarker("Copy To Backbuffer");
-    frame.CommandBuffer->Barrier(out->Texture, ResourceLayout::CopySource);
-    frame.CommandBuffer->Barrier(frame.Backbuffer, ResourceLayout::CopyDest);
-    frame.CommandBuffer->CopyTextureToTexture(frame.Backbuffer, out->Texture);
-    frame.CommandBuffer->EndMarker();
 }
 
 void MainPass::UI()
 {
-    ImGui::SliderInt("Samples Per Pixel", &mSamplesPerPixel, 1, 50);
-    ImGui::SliderInt("Bounces Per Ray", &mBouncesPerRay, 1, 50);
+    int samples = mSamplesPerPixel;
+    int bounces = mBouncesPerRay;
+
+    ImGui::SliderInt("Samples Per Pixel", &samples, 1, 50);
+    ImGui::SliderInt("Bounces Per Ray", &bounces, 1, 50);
+
+    if (samples != mSamplesPerPixel || bounces != mBouncesPerRay) {
+        RHI::ResetFrameCount();
+    }
+    mSamplesPerPixel = samples;
+    mBouncesPerRay = bounces;
 }

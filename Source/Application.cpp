@@ -11,7 +11,7 @@ Application::Application()
 {
     mStart = SDL_GetTicks();
 
-    mWindow = std::make_shared<Window>(1280, 720, "Hello, World!");
+    mWindow = std::make_shared<Window>(WIDTH, HEIGHT, "Hello, World!");
     Oslo::AttachWindow(mWindow);
 
     mRenderer = std::make_shared<Renderer>();

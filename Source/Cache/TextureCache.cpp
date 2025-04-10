@@ -20,7 +20,7 @@ std::shared_ptr<Texture> TextureCache::Get(const std::string& path)
         desc.Levels = 1;
         desc.Name = path;
         desc.Usage = TextureUsage::ShaderResource;
-        desc.Format = TextureFormat::RGBA8;
+        desc.Format = TextureFormat::RGBA8_sRGB;
         
         mTextures[path] = std::make_shared<Texture>(desc);
         Uploader::EnqueueTextureUpload(data.Pixels, mTextures[path]);

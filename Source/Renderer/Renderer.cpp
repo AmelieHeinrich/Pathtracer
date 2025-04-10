@@ -7,7 +7,11 @@
 #include "RendererTools.hpp"
 
 #include "Cache/TextureCache.hpp"
+
 #include "Passes/MainPass.hpp"
+#include "Passes/ResolvePass.hpp"
+#include "Passes/TonemapPass.hpp"
+
 #include "Skybox.hpp"
 
 Renderer::Renderer()
@@ -16,7 +20,9 @@ Renderer::Renderer()
     SkyboxCooker::Init();
 
     mPasses = {
-        std::make_shared<MainPass>()
+        std::make_shared<MainPass>(),
+        std::make_shared<ResolvePass>(),
+        std::make_shared<TonemapPass>()
     };
 }
 
