@@ -14,6 +14,73 @@
 #include <glm/gtx/quaternion.hpp>
 #include <glm/gtc/type_ptr.hpp>
 
+void ComputeTangentSpace(std::vector<Vertex>& vertices, const std::vector<uint32_t>& indices)
+{
+    std::vector<glm::vec3> accumulatedTangents(vertices.size(), {0, 0, 0});
+    std::vector<glm::vec3> accumulatedBitangents(vertices.size(), {0, 0, 0});
+
+    for (size_t i = 0; i < indices.size(); i += 3) {
+        uint32_t i0 = indices[i];
+        uint32_t i1 = indices[i + 1];
+        uint32_t i2 = indices[i + 2];
+
+        const Vertex& v0 = vertices[i0];
+        const Vertex& v1 = vertices[i1];
+        const Vertex& v2 = vertices[i2];
+
+        glm::vec3 p0 = v0.Position;
+        glm::vec3 p1 = v1.Position;
+        glm::vec3 p2 = v2.Position;
+
+        glm::vec2 uv0 = v0.UV;
+        glm::vec2 uv1 = v1.UV;
+        glm::vec2 uv2 = v2.UV;
+
+        glm::vec3 edge1 = p1 - p0;
+        glm::vec3 edge2 = p2 - p0;
+
+        float u1 = uv1.x - uv0.x;
+        float v1_ = uv1.y - uv0.y;
+        float u2 = uv2.x - uv0.x;
+        float v2_ = uv2.y - uv0.y;
+
+        float det = (u1 * v2_ - u2 * v1_);
+        float invDet = (det != 0.0f) ? 1.0f / det : 0.0f;
+
+        glm::vec3 tangent = (edge1 * v2_ - edge2 * v1_) * invDet;
+        glm::vec3 bitangent = (edge2 * u1 - edge1 * u2) * invDet;
+
+        // Accumulate tangents and bitangents
+        accumulatedTangents[i0] += tangent;
+        accumulatedTangents[i1] += tangent;
+        accumulatedTangents[i2] += tangent;
+
+        accumulatedBitangents[i0] += bitangent;
+        accumulatedBitangents[i1] += bitangent;
+        accumulatedBitangents[i2] += bitangent;
+    }
+
+    // Normalize and orthogonalize
+    for (size_t i = 0; i < vertices.size(); ++i) {
+        glm::vec3 n = vertices[i].Normal;
+        glm::vec3 t = accumulatedTangents[i];
+
+        // Gram-Schmidt orthogonalization
+        t = glm::normalize(t - glm::dot(n, t) * n);
+
+        // Compute handedness via bitangent
+        glm::vec3 b = glm::cross(n, t);
+        glm::vec3 expectedB = accumulatedBitangents[i];
+
+        // If the bitangent is pointing in the wrong direction, flip the tangent
+        float handedness = (glm::dot(b, expectedB) < 0.0f) ? -1.0f : 1.0f;
+
+        // Store the tangent and bitangent (bitangent only if you need it separately)
+        vertices[i].Tangent = t * handedness;
+        vertices[i].Bitangent = glm::cross(n, t) * handedness; // Optional, for use in shaders
+    }
+}
+
 void GLTF::Load(const std::string& path)
 {
     Path = path;
@@ -45,6 +112,7 @@ void GLTF::Load(const std::string& path)
     for (auto& material : Materials) {
         RaytracingMaterial mat = {};
         mat.AlbedoIndex = material.AlbedoView->GetDescriptor().Index;
+        mat.NormalIndex = material.NormalView ? material.NormalView->GetDescriptor().Index : -1;
 
         rtMaterials.push_back(mat);
     }
@@ -170,6 +238,7 @@ void GLTF::ProcessPrimitive(cgltf_primitive *primitive, GLTFNode *node)
     for (int i = 0; i < indexCount; i++) {
         indices.push_back(cgltf_accessor_read_index(primitive->indices, i));
     }
+    ComputeTangentSpace(vertices, indices);
 
     out.VertexCount = vertexCount;
     out.IndexCount = indexCount;
@@ -193,10 +262,17 @@ void GLTF::ProcessPrimitive(cgltf_primitive *primitive, GLTFNode *node)
             std::string path = Directory + '/' + std::string(material->pbr_metallic_roughness.base_color_texture.texture->image->uri);
     
             outMaterial.Albedo = TextureCache::Get(path);
-            outMaterial.AlbedoView = std::make_shared<View>(outMaterial.Albedo, ViewType::ShaderResource);
+            outMaterial.AlbedoView = std::make_shared<View>(outMaterial.Albedo, ViewType::ShaderResource, ViewDimension::Texture, TextureFormat::RGBA8_sRGB);
         } else {
             outMaterial.Albedo = RendererTools::Get("BlackTexture")->Texture;
             outMaterial.AlbedoView = RendererTools::Get("BlackTexture")->GetView(ViewType::ShaderResource);
+        }
+
+        if (material->normal_texture.texture) {
+            std::string path = Directory + '/' + std::string(material->normal_texture.texture->image->uri);
+
+            outMaterial.Normal = TextureCache::Get(path);
+            outMaterial.NormalView = std::make_shared<View>(outMaterial.Albedo, ViewType::ShaderResource, ViewDimension::Texture, TextureFormat::RGBA8);
         }
 
         outMaterial.AlphaTested = (material->alpha_mode != cgltf_alpha_mode_opaque);

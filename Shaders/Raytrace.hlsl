@@ -18,7 +18,8 @@ struct Instance
 struct Material
 {
     int AlbedoIndex;
-    int3 Pad;
+    int NormalIndex;
+    int2 Pad;
 };
 
 struct Vertex
@@ -147,6 +148,8 @@ void RayGeneration()
 [shader("closesthit")]
 void ClosestHit(inout RayPayload Payload, in BuiltInTriangleIntersectionAttributes Attr)
 {
+    float3 hitPos = WorldRayOrigin() + RayTCurrent() * WorldRayDirection();
+
     StructuredBuffer<Instance> bInstances = ResourceDescriptorHeap[bConstants.nInstanceBuffer];
     Instance instance = bInstances[InstanceIndex()];
     
@@ -169,6 +172,7 @@ void ClosestHit(inout RayPayload Payload, in BuiltInTriangleIntersectionAttribut
     Vertex v1 = bVertices[indices.y];
     Vertex v2 = bVertices[indices.z];
 
+    // Attributes
     float3 bary = float3(
         1.0 - Attr.barycentrics.x - Attr.barycentrics.y,
         Attr.barycentrics.x,
@@ -180,14 +184,25 @@ void ClosestHit(inout RayPayload Payload, in BuiltInTriangleIntersectionAttribut
         Attr.barycentrics.x * v1.Normal +
         Attr.barycentrics.y * v2.Normal
     );
-    float3 albedo = tAlbedo.SampleLevel(sSampler, uv, 0.0).rgb;
+    float3 tangent = normalize(
+        (1.0 - Attr.barycentrics.x - Attr.barycentrics.y) * v0.Tangent +
+        Attr.barycentrics.x * v1.Tangent +
+        Attr.barycentrics.y * v2.Tangent
+    );
+    float3 bitangent = normalize(
+        (1.0 - Attr.barycentrics.x - Attr.barycentrics.y) * v0.Bitangent +
+        Attr.barycentrics.x * v1.Bitangent +
+        Attr.barycentrics.y * v2.Bitangent
+    );
+    // normal = GetNormalFromMap(material.NormalIndex, uv, normal, tangent, bitangent);
 
     // Set new dir
     float3 direction = next_unit_on_hemisphere(Payload.rng, normal);
     Payload.NewDirection = direction;
-    Payload.NewOrigin = (WorldRayOrigin() + RayTCurrent() * WorldRayDirection()) + (normal * 0.001);
+    Payload.NewOrigin = hitPos + (normal * 0.001);
     
     // Shade
+    float3 albedo = tAlbedo.SampleLevel(sSampler, uv, 0.0).rgb;
     float cosTheta = dot(normal, direction);
     float pdf = cosTheta / 3.14159;
     float3 f_r = albedo / 3.14159;

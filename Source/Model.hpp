@@ -17,13 +17,17 @@
 struct RaytracingMaterial
 {
     int AlbedoIndex;
-    glm::ivec3 Pad;
+    int NormalIndex;
+    glm::ivec2 Pad;
 };
 
 struct GLTFMaterial
 {
     std::shared_ptr<Texture> Albedo;
     std::shared_ptr<View> AlbedoView;
+
+    std::shared_ptr<Texture> Normal;
+    std::shared_ptr<View> NormalView;
 
     bool AlphaTested = false;
 };
