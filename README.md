@@ -6,4 +6,4 @@ It's goal is to provide me with the resources to learn everything about light tr
 ## Screenshots
 
 Screenshot as of April 10th 2025:
-![image](.github/pt.png)
+![image](.github/pt_new.png)
