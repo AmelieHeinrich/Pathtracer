@@ -194,6 +194,8 @@ void GLTF::ProcessPrimitive(cgltf_primitive *primitive, GLTFNode *node)
             outMaterial.Albedo = TextureCache::Get(path);
             outMaterial.AlbedoView = std::make_shared<View>(outMaterial.Albedo, ViewType::ShaderResource);
         }
+
+        outMaterial.AlphaTested = (material->alpha_mode != cgltf_alpha_mode_opaque);
     }
 
     Materials.push_back(outMaterial);

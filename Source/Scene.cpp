@@ -20,8 +20,11 @@ void Scene::Build()
     for (auto& entity : Entities) {
         entity->Model.TraverseNode(entity->Model.Root, [&](GLTFNode* node){
             for (auto& primitive : node->Primitives) {
+                GLTFMaterial material = entity->Model.Materials[primitive.MaterialIndex];
+
                 glm::mat4 transform = glm::mat4(primitive.Instance.Transform) * entity->Transform;
                 primitive.Instance.Transform = glm::mat3x4(transform);
+                primitive.Instance.Flags = material.AlphaTested ? D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_NON_OPAQUE : D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE;
                 Instances.push_back(primitive.Instance);
             }
         });
