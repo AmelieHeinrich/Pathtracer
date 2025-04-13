@@ -19,7 +19,8 @@ struct Material
 {
     int AlbedoIndex;
     int NormalIndex;
-    int2 Pad;
+    int PBRIndex;
+    int Pad;
 };
 
 struct Vertex
@@ -70,6 +71,41 @@ struct RayPayload
 
     RNG rng;
 };
+
+float3 GetNormalFromNormalMap(int normalIndex, float2 uv, float3 normal, float3 tangent, float3 bitangent)
+{
+    if (normalIndex == -1)
+        return normalize(normal);
+
+    Texture2D<float4> normalMap = ResourceDescriptorHeap[normalIndex];
+    SamplerState sampler = SamplerDescriptorHeap[bConstants.nWrapSampler];
+
+    // Sample the normal map (assumes normals are stored in [0,1] range)
+    float3 normalSample = normalMap.SampleLevel(sampler, uv, 0.0).rgb;
+
+    // Transform from [0,1] to [-1,1]
+    normalSample = normalSample * 2.0f - 1.0f;
+
+    // Construct the TBN matrix
+    float3x3 TBN = float3x3(tangent, bitangent, normal);
+
+    // Transform the normal from tangent space to world space
+    float3 worldNormal = normalize(mul(normalSample, TBN));
+
+    return worldNormal;
+}
+
+float2 GetMetallicRoughness(int pbrIndex, float2 uv)
+{
+    if (pbrIndex == -1)
+        return float2(0, 0.5);
+
+    Texture2D<float4> pbrMap = ResourceDescriptorHeap[pbrIndex];
+    SamplerState sampler = SamplerDescriptorHeap[bConstants.nWrapSampler];
+
+    float4 data = pbrMap.SampleLevel(sampler, uv, 0.0);
+    return float2(data.b, data.g);
+}
 
 [shader("raygeneration")]
 void RayGeneration()
@@ -194,7 +230,7 @@ void ClosestHit(inout RayPayload Payload, in BuiltInTriangleIntersectionAttribut
         Attr.barycentrics.x * v1.Bitangent +
         Attr.barycentrics.y * v2.Bitangent
     );
-    // normal = GetNormalFromMap(material.NormalIndex, uv, normal, tangent, bitangent);
+    normal = GetNormalFromNormalMap(material.NormalIndex, uv, normal, tangent, bitangent);
 
     // Set new dir
     float3 direction = next_unit_on_hemisphere(Payload.rng, normal);

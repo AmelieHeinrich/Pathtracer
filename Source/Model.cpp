@@ -113,6 +113,7 @@ void GLTF::Load(const std::string& path)
         RaytracingMaterial mat = {};
         mat.AlbedoIndex = material.AlbedoView->GetDescriptor().Index;
         mat.NormalIndex = material.NormalView ? material.NormalView->GetDescriptor().Index : -1;
+        mat.PBRIndex = material.PBRView ? material.PBRView->GetDescriptor().Index : -1;
 
         rtMaterials.push_back(mat);
     }
@@ -272,7 +273,14 @@ void GLTF::ProcessPrimitive(cgltf_primitive *primitive, GLTFNode *node)
             std::string path = Directory + '/' + std::string(material->normal_texture.texture->image->uri);
 
             outMaterial.Normal = TextureCache::Get(path);
-            outMaterial.NormalView = std::make_shared<View>(outMaterial.Albedo, ViewType::ShaderResource, ViewDimension::Texture, TextureFormat::RGBA8);
+            outMaterial.NormalView = std::make_shared<View>(outMaterial.Normal, ViewType::ShaderResource, ViewDimension::Texture, TextureFormat::RGBA8);
+        }
+
+        if (material->pbr_metallic_roughness.metallic_roughness_texture.texture) {
+            std::string path = Directory + '/' + std::string(material->pbr_metallic_roughness.metallic_roughness_texture.texture->image->uri);
+
+            outMaterial.PBR = TextureCache::Get(path);
+            outMaterial.PBRView = std::make_shared<View>(outMaterial.PBR, ViewType::ShaderResource, ViewDimension::Texture, TextureFormat::RGBA8);
         }
 
         outMaterial.AlphaTested = (material->alpha_mode != cgltf_alpha_mode_opaque);
