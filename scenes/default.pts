@@ -1,0 +1,54 @@
+# pathtracer scene v1
+
+camera
+  position 4.6 3.1 8.6
+  yaw -152
+  pitch -13
+  fov 40
+
+entity "ground"
+  shape       plane
+  translation 0 0 0
+  rotation    0 0 0
+  scale       14 1 14
+  albedo      0.62 0.62 0.64
+  roughness   1
+
+entity "cube"
+  shape       cube
+  translation -3.3 0.8 0
+  rotation    0 0 0
+  scale       0.8 0.8 0.8
+  albedo      0.85 0.24 0.18
+  roughness   1
+
+# Mirror, so the analytic sphere normals show up as a clean reflection.
+entity "sphere"
+  shape       sphere
+  translation -1.1 0.85 0
+  rotation    0 0 0
+  scale       0.85 0.85 0.85
+  albedo      0.95 0.95 0.97
+  roughness   0
+
+entity "cylinder"
+  shape       cylinder
+  translation 1.1 0.9 0
+  rotation    0 0 0
+  scale       0.55 0.9 0.55
+  albedo      0.24 0.68 0.34
+  roughness   1
+
+entity "cone"
+  shape       cone
+  translation 3.3 0.9 0
+  rotation    0 0 0
+  scale       0.75 0.9 0.75
+  albedo      0.26 0.42 0.9
+  roughness   1
+
+light "key"
+  type      point
+  position  0.5 4.4 2.6
+  color     1 0.92 0.78
+  intensity 60

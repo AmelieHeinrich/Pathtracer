@@ -1,0 +1,76 @@
+# pathtracer scene v1
+#
+# The Cornell box, built from scaled cubes: five walls and two blocks. Turn the sky down to 0
+# in the render panel -- the box is supposed to be lit by its own ceiling panel and nothing
+# else, and any sky leaking through the open front wall gives it away.
+#
+# The panel is an `area` light. It has no geometry in the acceleration structure, so the
+# integrator samples it directly and no bounce ray can find it twice; it is drawn for the
+# camera ray alone, which is why you can still see it on the ceiling.
+
+camera
+  position 0 2.75 8.6
+  yaw 180
+  pitch 0
+  fov 40
+
+entity "floor"
+  shape       cube
+  translation 0 -0.1 0
+  scale       2.75 0.1 2.75
+  albedo      0.73 0.73 0.73
+  roughness   1
+
+entity "ceiling"
+  shape       cube
+  translation 0 5.6 0
+  scale       2.75 0.1 2.75
+  albedo      0.73 0.73 0.73
+  roughness   1
+
+entity "back wall"
+  shape       cube
+  translation 0 2.75 -2.85
+  scale       2.75 2.85 0.1
+  albedo      0.73 0.73 0.73
+  roughness   1
+
+entity "left wall"
+  shape       cube
+  translation -2.85 2.75 0
+  scale       0.1 2.85 2.75
+  albedo      0.65 0.05 0.05
+  roughness   1
+
+entity "right wall"
+  shape       cube
+  translation 2.85 2.75 0
+  scale       0.1 2.85 2.75
+  albedo      0.12 0.45 0.15
+  roughness   1
+
+entity "tall block"
+  shape       cube
+  translation -0.9 1.65 -0.9
+  rotation    0 18 0
+  scale       0.85 1.65 0.85
+  albedo      0.73 0.73 0.73
+  roughness   1
+
+entity "short block"
+  shape       cube
+  translation 1.05 0.8 0.8
+  rotation    0 -17 0
+  scale       0.85 0.8 0.85
+  albedo      0.73 0.73 0.73
+  roughness   1
+
+# Just below the ceiling, facing down. Radiance over the whole face, so the number is far
+# smaller than a point light's would be.
+light "ceiling panel"
+  type      area
+  position  0 5.45 0
+  direction 0 -1 0
+  color     1 0.85 0.68
+  intensity 14
+  size      0.75 0.75

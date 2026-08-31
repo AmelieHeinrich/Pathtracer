@@ -1,0 +1,150 @@
+// Analytic intersection shaders for the procedural primitives.
+//
+// #include'd into pathtracer.slang rather than compiled on its own: the .slangh extension
+// keeps it out of the shaders/*.slang glob in xmake.lua, and every entry point has to end
+// up in the one SPIR-V module the ray tracing pipeline is built from.
+//
+// Each shape is the canonical unit shape described in src/scene.h, so none of these takes a
+// parameter. Position and size arrive as the instance transform, which the traversal has
+// already applied to ObjectRayOrigin/ObjectRayDirection. That object-space direction is
+// deliberately *not* normalised: leaving it as the transformed world direction is what makes
+// the t values solved here directly comparable with the world-space ray interval.
+
+// Reported by every intersection shader below and consumed by closesthit_procedural. Well
+// inside the 32 byte hit attribute budget.
+struct ProcAttrib {
+    float3 object_normal;
+};
+
+// Returns false when there is no real root. Roots come back ordered.
+bool solve_quadratic(float a, float b, float c, out float t0, out float t1)
+{
+    t0 = 0.0f;
+    t1 = 0.0f;
+
+    const float discriminant = b * b - 4.0f * a * c;
+    if (discriminant < 0.0f) {
+        return false;
+    }
+
+    const float root = sqrt(discriminant);
+    // The usual sign trick: computing the root of larger magnitude first and the other by
+    // Vieta's formula avoids the catastrophic cancellation of (-b +- root) / 2a.
+    const float q = -0.5f * (b + (b >= 0.0f ? root : -root));
+    t0 = q / a;
+    t1 = c / q;
+    if (t0 > t1) {
+        const float swap = t0;
+        t0 = t1;
+        t1 = swap;
+    }
+    return true;
+}
+
+// Both roots are always reported rather than just the nearest: ReportHit clips each against
+// [RayTMin, RayTCurrent] itself, and reporting both is what keeps the shape correct when the
+// ray starts inside it.
+void report(float t, float3 object_normal)
+{
+    ProcAttrib attrib;
+    attrib.object_normal = object_normal;
+    ReportHit(t, 0u, attrib);
+}
+
+// |p| = 1
+[shader("intersection")]
+void isect_sphere()
+{
+    const float3 o = ObjectRayOrigin();
+    const float3 d = ObjectRayDirection();
+
+    float t0 = 0.0f;
+    float t1 = 0.0f;
+    if (!solve_quadratic(dot(d, d), 2.0f * dot(o, d), dot(o, o) - 1.0f, t0, t1)) {
+        return;
+    }
+
+    report(t0, o + t0 * d);
+    report(t1, o + t1 * d);
+}
+
+// x^2 + z^2 = 1 for y in [-1,1], with flat caps at y = +-1.
+[shader("intersection")]
+void isect_cylinder()
+{
+    const float3 o = ObjectRayOrigin();
+    const float3 d = ObjectRayDirection();
+
+    const float a = d.x * d.x + d.z * d.z;
+    // a == 0 means the ray runs straight along the axis, which can only ever hit the caps.
+    if (a > 1e-9f) {
+        float t0 = 0.0f;
+        float t1 = 0.0f;
+        if (solve_quadratic(a, 2.0f * (o.x * d.x + o.z * d.z),
+                            o.x * o.x + o.z * o.z - 1.0f, t0, t1)) {
+            const float y0 = o.y + t0 * d.y;
+            if (abs(y0) <= 1.0f) {
+                report(t0, float3(o.x + t0 * d.x, 0.0f, o.z + t0 * d.z));
+            }
+            const float y1 = o.y + t1 * d.y;
+            if (abs(y1) <= 1.0f) {
+                report(t1, float3(o.x + t1 * d.x, 0.0f, o.z + t1 * d.z));
+            }
+        }
+    }
+
+    if (abs(d.y) > 1e-9f) {
+        for (int i = 0; i < 2; ++i) {
+            const float y = (i == 0) ? -1.0f : 1.0f;
+            const float t = (y - o.y) / d.y;
+            const float x = o.x + t * d.x;
+            const float z = o.z + t * d.z;
+            if (x * x + z * z <= 1.0f) {
+                report(t, float3(0.0f, y, 0.0f));
+            }
+        }
+    }
+}
+
+// x^2 + z^2 = ((1-y)/2)^2 for y in [-1,1]: apex at y = +1, unit radius base at y = -1, with
+// a flat cap closing the base.
+[shader("intersection")]
+void isect_cone()
+{
+    const float3 o = ObjectRayOrigin();
+    const float3 d = ObjectRayDirection();
+
+    // Substituting p = o + t*d into x^2 + z^2 - ((1 - y)/2)^2 with u = 1 - o.y.
+    const float u = 1.0f - o.y;
+    const float a = d.x * d.x + d.z * d.z - 0.25f * d.y * d.y;
+    const float b = 2.0f * (o.x * d.x + o.z * d.z) + 0.5f * u * d.y;
+    const float c = o.x * o.x + o.z * o.z - 0.25f * u * u;
+
+    // a == 0 means the ray is parallel to the cone's surface, so it grazes at most once and
+    // whatever it does hit is picked up by the base cap below.
+    if (abs(a) > 1e-9f) {
+        float t0 = 0.0f;
+        float t1 = 0.0f;
+        if (solve_quadratic(a, b, c, t0, t1)) {
+            for (int i = 0; i < 2; ++i) {
+                const float t = (i == 0) ? t0 : t1;
+                const float3 p = o + t * d;
+                // The same equation also describes the mirrored cone above the apex, so the
+                // y range is what keeps this to the half the shape actually occupies.
+                if (p.y >= -1.0f && p.y <= 1.0f) {
+                    // Gradient of the implicit surface: (2x, (1-y)/2, 2z).
+                    report(t, float3(2.0f * p.x, 0.5f * (1.0f - p.y), 2.0f * p.z));
+                }
+            }
+        }
+    }
+
+    if (abs(d.y) > 1e-9f) {
+        const float t = (-1.0f - o.y) / d.y;
+        const float x = o.x + t * d.x;
+        const float z = o.z + t * d.z;
+        if (x * x + z * z <= 1.0f) {
+            report(t, float3(0.0f, -1.0f, 0.0f));
+        }
+    }
+}
