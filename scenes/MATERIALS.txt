@@ -1,0 +1,308 @@
+Material reference
+==================
+
+Copy any block below into an `entity` in a .pts file, under its shape and transform. Every key
+is optional; anything left out keeps its default, so an opaque grey surface is still just an
+albedo and a roughness.
+
+    entity "my thing"
+      shape       sphere
+      translation 0 1 0
+      scale       1 1 1
+      <-- paste here
+
+Defaults, for reference:
+
+    albedo              0.7 0.7 0.7
+    roughness           1        1 is fully diffuse, 0 is a perfect mirror
+    metallic            0        0 is a dielectric, 1 is a conductor
+    transmission        0        0 is opaque
+    ior                 1.5      only read when transmission > 0
+    abbe                0        0 disables dispersion
+    absorption          1 1 1    white is no absorption at all
+    absorption_distance 1
+
+
+THE FIVE PARAMETERS
+-------------------
+
+roughness       How spread out the reflection is. This is perceptual, not physical: the
+                microfacet slope is roughness squared, which is what keeps the interesting
+                values spread across the slider instead of crowded into its first tenth.
+                Below about 0.03 the surface becomes a true mirror -- see the note on punctual
+                lights at the bottom.
+
+metallic        In practice 0 or 1, not a dial. A conductor has no diffuse layer, so its
+                albedo stops being a surface colour and becomes the colour of its reflection.
+                Values in between are not physical; they exist because they are convenient for
+                worn or partly oxidised surfaces.
+
+transmission    How much light goes through instead of bouncing off. Dielectrics only -- a
+                metal is opaque, and metallic wins if you set both.
+
+ior             Refractive index, quoted at the sodium d-line (587.6nm) as glass catalogues do.
+                Drives both how much the light bends and how strong the reflection is, so a
+                higher index gives a more mirror-like surface as well as a more distorting one.
+
+abbe            How much the index varies across the visible band -- the optical measure of
+                dispersion. Confusingly, a *lower* number means *more* colour separation.
+                0 turns it off entirely and is meaningfully cheaper: a dispersive refraction
+                collapses the path to one wavelength, costing roughly 16% more noise.
+
+absorption      Beer-Lambert. Author it as the colour the material becomes after
++ _distance     `absorption_distance` of travel through it. Because it is absorption and not a
+                surface tint, it deepens with thickness -- the middle of a sphere goes darker
+                and more saturated than its edges, which is exactly what real coloured glass
+                does and what a surface colour cannot fake. Distance is in world units, so it
+                is relative to how big your object is.
+
+
+METALS
+------
+Conductors: metallic 1, and the albedo is the reflectance colour. These are the standard
+tabulated linear-sRGB values -- good approximations of the real complex refractive index,
+which is what a renderer with measured n,k curves would use instead.
+
+Gold
+      albedo      1.0 0.766 0.336
+      roughness   0.05
+      metallic    1
+
+Silver
+      albedo      0.972 0.960 0.915
+      roughness   0.05
+      metallic    1
+
+Copper
+      albedo      0.955 0.638 0.538
+      roughness   0.1
+      metallic    1
+
+Aluminium
+      albedo      0.913 0.921 0.925
+      roughness   0.08
+      metallic    1
+
+Chrome
+      albedo      0.550 0.556 0.554
+      roughness   0.02
+      metallic    1
+
+Iron
+      albedo      0.560 0.570 0.580
+      roughness   0.25
+      metallic    1
+
+Brushed steel
+      albedo      0.560 0.570 0.580
+      roughness   0.35
+      metallic    1
+
+Tarnished gold      (a metal that has stopped being a clean mirror)
+      albedo      0.82 0.63 0.31
+      roughness   0.45
+      metallic    1
+
+
+GLASS AND OTHER DIELECTRICS
+---------------------------
+Set transmission 1 and give it an index. Roughness works here too -- that is frosted glass.
+
+Window glass
+      albedo       1 1 1
+      roughness    0
+      transmission 1
+      ior          1.52
+
+Frosted glass       (raise roughness for more diffusion; 0.5 is nearly opal)
+      albedo       1 1 1
+      roughness    0.25
+      transmission 1
+      ior          1.52
+
+Water
+      albedo       1 1 1
+      roughness    0
+      transmission 1
+      ior          1.333
+
+Ice
+      albedo       1 1 1
+      roughness    0.12
+      transmission 1
+      ior          1.31
+
+Acrylic / perspex
+      albedo       1 1 1
+      roughness    0
+      transmission 1
+      ior          1.49
+
+Soap bubble         (thin, so almost all reflection at grazing angles)
+      albedo       1 1 1
+      roughness    0
+      transmission 1
+      ior          1.34
+
+
+DISPERSIVE -- gemstones and optical glass
+-----------------------------------------
+Add an abbe number. Lower means more colour separation. These pairs are close to the real
+materials; the index is at the d-line and the Abbe number is the catalogue value.
+
+Crown glass (BK7)   the ordinary optical glass; dispersion present but subtle
+      albedo       1 1 1
+      roughness    0
+      transmission 1
+      ior          1.517
+      abbe         64
+
+Dense flint (SF11)  about as dispersive as glass gets, and the cheapest way to see fire
+      albedo       1 1 1
+      roughness    0
+      transmission 1
+      ior          1.785
+      abbe         26
+
+Diamond             high index and strong dispersion together, hence the sparkle
+      albedo       1 1 1
+      roughness    0
+      transmission 1
+      ior          2.417
+      abbe         55
+
+Sapphire            high index, but genuinely low dispersion
+      albedo       1 1 1
+      roughness    0
+      transmission 1
+      ior          1.77
+      abbe         72
+
+Cubic zirconia      the diamond simulant; more fire than diamond, less brilliance
+      albedo       1 1 1
+      roughness    0
+      transmission 1
+      ior          2.16
+      abbe         30
+
+
+COLOURED GLASS -- absorption
+----------------------------
+The colour is what the material becomes after `absorption_distance` of travel. Tune the
+distance against the size of your object: a distance much larger than the object barely tints
+it, much smaller and it goes nearly black.
+
+Green bottle glass
+      albedo       1 1 1
+      roughness    0
+      transmission 1
+      ior          1.52
+      absorption   0.16 0.62 0.34
+      absorption_distance 1
+
+Amber
+      albedo       1 1 1
+      roughness    0
+      transmission 1
+      ior          1.55
+      absorption   0.85 0.45 0.10
+      absorption_distance 1
+
+Red wine
+      albedo       1 1 1
+      roughness    0
+      transmission 1
+      ior          1.35
+      absorption   0.55 0.06 0.12
+      absorption_distance 0.6
+
+Jade                absorbing *and* frosted, which reads as translucent stone
+      albedo       1 1 1
+      roughness    0.35
+      transmission 1
+      ior          1.66
+      absorption   0.32 0.68 0.44
+      absorption_distance 0.4
+
+Emerald
+      albedo       1 1 1
+      roughness    0
+      transmission 1
+      ior          1.577
+      abbe         70
+      absorption   0.22 0.75 0.42
+      absorption_distance 1.5
+
+Smoked glass
+      albedo       1 1 1
+      roughness    0
+      transmission 1
+      ior          1.52
+      absorption   0.35 0.35 0.38
+      absorption_distance 1
+
+
+OPAQUE DIELECTRICS
+------------------
+No new keys -- just albedo and roughness. Included because the specular layer a dielectric
+always carries is what separates these from each other.
+
+Polished ceramic
+      albedo      0.9 0.89 0.86
+      roughness   0.05
+
+Glossy plastic
+      albedo      0.2 0.45 0.8
+      roughness   0.15
+
+Matte plastic
+      albedo      0.2 0.45 0.8
+      roughness   0.6
+
+Rubber
+      albedo      0.06 0.06 0.07
+      roughness   0.85
+
+Chalk / plaster
+      albedo      0.88 0.87 0.84
+      roughness   1
+
+Polished wood       (colour it however you like; the point is the roughness)
+      albedo      0.35 0.19 0.09
+      roughness   0.3
+
+
+THINGS WORTH KNOWING
+--------------------
+
+Roughness 0 and punctual lights.
+    A perfectly smooth surface is a delta: it reflects exactly one direction, so a point,
+    spot, or directional light has zero chance of lying on it and contributes nothing. This is
+    correct, not a bug -- a real mirror does not have a highlight, it has a reflection. If you
+    want a visible highlight from a lamp, give the surface some roughness (0.05 is plenty), or
+    use an `area` light, which has real extent.
+
+Solid glass lit from behind by a punctual light comes out about 15% dim.
+    Direct lighting through a refractive surface assumes the light sits where it appears in a
+    straight line. That holds across a *single* interface -- a pane, a window -- and is exact
+    there. Through anything solid the light has to bend twice, so the assumption breaks and the
+    direct contribution is deliberately dropped rather than trusted; the light still arrives,
+    by the paths that refract properly. Use an area light or emissive geometry behind glass and
+    the result is correct with no caveat.
+
+Do not nest transmissive objects.
+    Absorption tracks one medium at a time, so a gem inside water will get the boundaries
+    wrong -- leaving the inner object clears the outer one's absorption.
+
+Dispersion is noisier.
+    Setting `abbe` collapses each path to a single wavelength, which costs roughly 16% more
+    noise on that object. Leave it at 0 unless you want the colour separation.
+
+Very rough metals lose a little energy.
+    A single-scattering microfacet model does not put back the light that would have bounced a
+    second time across the microsurface. At roughness 1 that is about 3%, and it falls off
+    quickly as the surface smooths.
+
+Absorption needs transmission.
+    It describes what happens to light *inside* the material, so it does nothing on an opaque
+    surface. Likewise `ior` and `abbe` are only read when transmission is above zero.

@@ -1,0 +1,552 @@
+// The surface model: a GGX microfacet specular lobe over a Lambertian base, with a metallic
+// parameter selecting between the two ways a surface can reflect.
+//
+// This replaces what used to be a straight lerp between a mirror direction and a cosine
+// hemisphere sample. That blend had no pdf and no Fresnel, which is why the integrator had to
+// scale next event estimation by `roughness` to keep punctual lights off mirrors. Here that
+// falls out instead: `bsdf_eval` returns zero for a delta lobe, so a light simply cannot
+// contribute to a perfect mirror and the fudge is gone.
+//
+// Everything is spectral. A conductor's Fresnel F0 is its upsampled albedo, so gold reflects
+// gold -- which is the whole reason this waited for the spectral port.
+//
+// Conventions: `wo` points away from the surface toward where the ray came from, `wi` toward
+// where it is going. Both are in a local frame whose +z is the shading normal.
+
+// Below this the specular lobe is a delta: sampling it is a mirror reflection and evaluating
+// it is identically zero. Corresponds to a roughness of about 0.03, since alpha = roughness^2.
+static const float PT_GGX_DELTA = 1e-3f;
+static const float PT_PI = 3.14159265358979f;
+
+// ---------------------------------------------------------------------------
+// local frame
+// ---------------------------------------------------------------------------
+
+struct Frame {
+    float3 tangent, bitangent, normal;
+};
+
+Frame frame_from_normal(float3 n)
+{
+    Frame f;
+    f.normal = n;
+    // The same conditioning trick cosine_hemisphere uses: cross with whichever axis `n` is
+    // least aligned with.
+    const float3 helper = abs(n.x) > 0.9f ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
+    f.tangent = normalize(cross(n, helper));
+    f.bitangent = cross(n, f.tangent);
+    return f;
+}
+
+float3 to_local(Frame f, float3 v)
+{
+    return float3(dot(v, f.tangent), dot(v, f.bitangent), dot(v, f.normal));
+}
+
+float3 to_world(Frame f, float3 v)
+{
+    return v.x * f.tangent + v.y * f.bitangent + v.z * f.normal;
+}
+
+// ---------------------------------------------------------------------------
+// GGX
+// ---------------------------------------------------------------------------
+
+// Trowbridge-Reitz normal distribution.
+float ggx_d(float3 h, float alpha)
+{
+    const float a2 = alpha * alpha;
+    const float denom = h.z * h.z * (a2 - 1.0f) + 1.0f;
+    return a2 / max(PT_PI * denom * denom, 1e-9f);
+}
+
+// Smith's masking function, in the height-correlated form below.
+float smith_lambda(float3 w, float alpha)
+{
+    const float c2 = w.z * w.z;
+    if (c2 >= 1.0f) {
+        return 0.0f;
+    }
+    const float tan2 = (1.0f - c2) / max(c2, 1e-9f);
+    return 0.5f * (sqrt(1.0f + alpha * alpha * tan2) - 1.0f);
+}
+
+float smith_g1(float3 w, float alpha)
+{
+    return 1.0f / (1.0f + smith_lambda(w, alpha));
+}
+
+// Height-correlated Smith, which is the form that pairs with the weight below.
+float smith_g2(float3 wo, float3 wi, float alpha)
+{
+    return 1.0f / (1.0f + smith_lambda(wo, alpha) + smith_lambda(wi, alpha));
+}
+
+// Sampling the distribution of *visible* normals, after Heitz 2018. Sampling visible normals
+// rather than the raw NDF is what makes the surviving weight below so simple: every sampled
+// half vector is one the viewer can actually see, so nothing has to be rejected and the
+// masking term cancels down to a ratio.
+float3 sample_vndf(float3 wo, float alpha, float u1, float u2)
+{
+    // Warp to the hemisphere configuration, where the distribution is isotropic.
+    const float3 vh = normalize(float3(alpha * wo.x, alpha * wo.y, wo.z));
+
+    const float lensq = vh.x * vh.x + vh.y * vh.y;
+    const float3 t1 = lensq > 1e-9f ? float3(-vh.y, vh.x, 0.0f) * rsqrt(lensq)
+                                    : float3(1.0f, 0.0f, 0.0f);
+    const float3 t2 = cross(vh, t1);
+
+    // A uniform point on the disc, squashed to account for the projection.
+    const float r = sqrt(u1);
+    const float phi = 6.28318530718f * u2;
+    const float p1 = r * cos(phi);
+    float p2 = r * sin(phi);
+    const float s = 0.5f * (1.0f + vh.z);
+    p2 = (1.0f - s) * sqrt(max(0.0f, 1.0f - p1 * p1)) + s * p2;
+
+    const float3 nh = p1 * t1 + p2 * t2 + sqrt(max(0.0f, 1.0f - p1 * p1 - p2 * p2)) * vh;
+
+    // Unwarp. The z clamp keeps a grazing sample from producing a degenerate half vector.
+    return normalize(float3(alpha * nh.x, alpha * nh.y, max(1e-6f, nh.z)));
+}
+
+// Schlick's approximation, spectral because a conductor's F0 is its own colour.
+Spectrum fresnel_schlick(Spectrum f0, float cos_theta)
+{
+    const float m = saturate(1.0f - cos_theta);
+    const float m2 = m * m;
+    return f0 + (Spectrum(1.0f) - f0) * (m2 * m2 * m);
+}
+
+// ---------------------------------------------------------------------------
+// dielectrics
+// ---------------------------------------------------------------------------
+
+// The unpolarised Fresnel reflectance of a smooth dielectric. Not Schlick: transmission needs
+// the real thing, because Schlick has no way to express total internal reflection and TIR is
+// most of what makes glass look like glass.
+//
+// `eta` is the ratio of the index on the far side to the index on the near side. A negative
+// cosine means the ray is arriving from inside, in which case the ratio inverts.
+float fresnel_dielectric(float cos_i, float eta)
+{
+    cos_i = clamp(cos_i, -1.0f, 1.0f);
+    if (cos_i < 0.0f) {
+        eta = 1.0f / eta;
+        cos_i = -cos_i;
+    }
+
+    const float sin2_t = (1.0f - cos_i * cos_i) / (eta * eta);
+    if (sin2_t >= 1.0f) {
+        return 1.0f; // total internal reflection: nothing gets through
+    }
+    const float cos_t = sqrt(1.0f - sin2_t);
+
+    const float parallel = (eta * cos_i - cos_t) / (eta * cos_i + cos_t);
+    const float perpendicular = (cos_i - eta * cos_t) / (cos_i + eta * cos_t);
+    return 0.5f * (parallel * parallel + perpendicular * perpendicular);
+}
+
+// Snell's law about a half vector that is the local +z axis. Returns false on total internal
+// reflection, in which case `wt` is not written.
+bool refract_local(float3 wo, float eta, out float3 wt)
+{
+    wt = float3(0.0f);
+
+    const float cos_i = wo.z;
+    const float sin2_t = (1.0f - cos_i * cos_i) / (eta * eta);
+    if (sin2_t >= 1.0f) {
+        return false;
+    }
+
+    // The tangential part shrinks by the index ratio; the normal part flips to the far side.
+    // The result is unit length by construction, so no normalize is needed.
+    wt = float3(-wo.x / eta, -wo.y / eta, -sqrt(1.0f - sin2_t));
+    return true;
+}
+
+// Cauchy's two-term dispersion, from the index at the sodium d-line and the Abbe number.
+//
+// The Abbe number *is* a statement about two-term Cauchy: it is defined as
+// (n_d - 1) / (n_F - n_C) over the hydrogen F and C lines, and n_F - n_C is B times the
+// difference of their inverse squares. So B falls straight out and A follows. Returning all
+// four wavelengths at once is what lets the caller notice that they disagree.
+float4 cauchy_ior(float ior_d, float abbe, float4 lambda)
+{
+    if (abbe <= 0.0f) {
+        return float4(ior_d); // dispersion off: one index for the whole path
+    }
+
+    // 1/486.13^2 - 1/656.27^2, in inverse square nanometres.
+    const float line_span = 1.9099e-6f;
+    const float b = (ior_d - 1.0f) / (abbe * line_span);
+    const float a = ior_d - b / (587.56f * 587.56f);
+    return a + b / (lambda * lambda);
+}
+
+// ---------------------------------------------------------------------------
+// the surface
+// ---------------------------------------------------------------------------
+
+// Everything the integrator knows about a surface, already resolved at this path's four
+// wavelengths. Transmission's fields land here next; nothing below reads a field it does not
+// have, so growing this stays additive.
+struct Surface {
+    Spectrum albedo; // upsampled reflectance
+    Spectrum f0;     // Fresnel at normal incidence: 0.04 for a dielectric, albedo for a metal
+    float3 normal;   // oriented against the incoming ray
+    float alpha;     // roughness squared
+    float metallic;
+    float transmission;
+    float4 ior;      // per wavelength, so dispersion is simply these four disagreeing
+    bool front_face; // false means the ray is inside the material, looking out
+};
+
+Surface make_surface(Spectrum albedo, float3 normal, float roughness, float metallic,
+                     float transmission, float4 ior, bool front_face)
+{
+    Surface s;
+    s.albedo = albedo;
+    s.normal = normal;
+    s.transmission = saturate(transmission);
+    s.ior = ior;
+    s.front_face = front_face;
+    // The perceptual remap. Authoring in roughness rather than alpha is what makes the slider
+    // feel linear; alpha itself crowds every interesting value into its first tenth.
+    s.alpha = saturate(roughness) * saturate(roughness);
+    s.metallic = saturate(metallic);
+    // 0.04 is the reflectance of an IOR 1.5 dielectric at normal incidence, which is close
+    // enough to universal for non-metals that it is the standard constant.
+    s.f0 = lerp(Spectrum(0.04f), albedo, s.metallic);
+    return s;
+}
+
+struct BsdfSample {
+    float3 direction;
+    Spectrum weight; // f * cos(theta_i) / pdf, so the caller just multiplies
+    // Next event estimation must skip this vertex: a delta lobe has no solid angle for a
+    // punctual light to occupy. This is what replaces the old `* roughness` scaling.
+    bool specular;
+    // The ray crossed the surface rather than bouncing off it. The caller has to offset the
+    // next ray on the other side, and to start or stop accumulating absorption.
+    bool transmitted;
+    // The four wavelengths would have refracted in four different directions, so only the
+    // hero could be followed. The caller drops the other three from the wavelength pdf, which
+    // is what turns spectral_resolve's balance heuristic into a single-wavelength estimator.
+    bool dispersive;
+};
+
+// How often to try the specular lobe rather than the diffuse one. Any probability gives an
+// unbiased result -- it divides back out -- so this only has to be *reasonable*, and being
+// bounded away from 0 and 1 is what keeps either lobe from becoming a variance spike.
+float specular_probability(Surface s)
+{
+    if (s.metallic >= 1.0f) {
+        return 1.0f; // a conductor has no diffuse lobe to choose
+    }
+    return clamp(spectrum_max(s.f0), 0.1f, 0.9f);
+}
+
+// ---------------------------------------------------------------------------
+// evaluate, for next event estimation
+// ---------------------------------------------------------------------------
+
+// The solid-angle density bsdf_sample would have produced for `wi_world`.
+//
+// MIS needs this and bsdf_sample cannot supply it: that function returns f*cos/pdf as a single
+// weight, with the density already divided out and unrecoverable. So this mirrors its
+// selection tree by hand, and the two have to be kept in step -- every branch here answers a
+// branch there.
+//
+// Returns 0 for a direction only a delta lobe could have produced. That is not a failure: a
+// zero density makes the MIS weight collapse to 1, which is exactly right, because no amount
+// of light sampling can ever hit a mirror direction.
+float bsdf_pdf(Surface s, float3 wo_world, float3 wi_world)
+{
+    const Frame f = frame_from_normal(s.normal);
+    const float3 wo = to_local(f, wo_world);
+    const float3 wi = to_local(f, wi_world);
+
+    if (wo.z <= 0.0f) {
+        return 0.0f;
+    }
+
+    // Matching bsdf_sample: transmission is chosen with probability s.transmission, and the
+    // opaque lobes split what is left by specular_probability.
+    const float p_transmission = s.transmission;
+    const float p_specular = (1.0f - p_transmission) * specular_probability(s);
+    const float p_diffuse = (1.0f - p_transmission) * (1.0f - specular_probability(s));
+
+    // A delta lobe has no density to speak of, so only the diffuse lobe can answer.
+    if (s.alpha < PT_GGX_DELTA) {
+        return wi.z > 0.0f ? p_diffuse * wi.z / PT_PI : 0.0f;
+    }
+
+    float pdf = 0.0f;
+
+    if (wi.z > 0.0f) {
+        // Reflection, from either the opaque specular lobe or the transmissive lobe's own
+        // Fresnel reflection. Both sample the same VNDF and mirror about the same half vector.
+        const float3 h = normalize(wo + wi);
+        const float dot_wo_h = dot(wo, h);
+        if (dot_wo_h > 0.0f) {
+            // The visible normal density, then the Jacobian of the mirror reflection.
+            const float pdf_h = ggx_d(h, s.alpha) * smith_g1(wo, s.alpha) * dot_wo_h / wo.z;
+            const float pdf_reflect = pdf_h / (4.0f * dot_wo_h);
+
+            pdf += p_specular * pdf_reflect;
+            if (p_transmission > 0.0f) {
+                const float eta = s.front_face ? s.ior.x : 1.0f / s.ior.x;
+                pdf += p_transmission * fresnel_dielectric(dot_wo_h, eta) * pdf_reflect;
+            }
+        }
+        pdf += p_diffuse * wi.z / PT_PI;
+    } else if (p_transmission > 0.0f) {
+        // Refraction. The half vector and its Jacobian are built exactly as bsdf_eval builds
+        // them -- same `partial` denominator, same eta convention -- so the two agree about
+        // what a refracted direction means rather than agreeing only in a textbook.
+        const float eta = s.front_face ? s.ior.x : 1.0f / s.ior.x;
+        float3 wm = wo + wi * eta;
+        if (dot(wm, wm) > 1e-12f) {
+            wm = normalize(wm);
+            wm = wm.z < 0.0f ? -wm : wm;
+
+            const float dot_wo_wm = dot(wo, wm);
+            const float dot_wi_wm = dot(wi, wm);
+            if (dot_wi_wm * wi.z <= 0.0f && dot_wo_wm * wo.z >= 0.0f) {
+                const float transmitted = 1.0f - fresnel_dielectric(dot_wo_wm, eta);
+                if (transmitted > 0.0f) {
+                    const float pdf_h =
+                        ggx_d(wm, s.alpha) * smith_g1(wo, s.alpha) * max(dot_wo_wm, 0.0f) / wo.z;
+                    const float partial = dot_wi_wm + dot_wo_wm / eta;
+                    const float jacobian = abs(dot_wi_wm) / max(partial * partial, 1e-9f);
+                    pdf += p_transmission * transmitted * pdf_h * jacobian;
+                }
+            }
+        }
+    }
+
+    return pdf;
+}
+
+// Returns f(wo, wi) * cos(theta_i). Zero for a delta lobe, which is exactly what stops a
+// punctual light from lighting a mirror -- correct by construction rather than by fudge.
+Spectrum bsdf_eval(Surface s, float3 wo_world, float3 wi_world)
+{
+    const Frame f = frame_from_normal(s.normal);
+    const float3 wo = to_local(f, wo_world);
+    const float3 wi = to_local(f, wi_world);
+
+    if (wo.z <= 0.0f) {
+        return Spectrum(0.0f);
+    }
+
+    // The light is on the far side of the surface, so only transmission can carry it. Without
+    // this branch a lamp behind frosted glass contributes nothing at all: the explicit lights
+    // are not in the acceleration structure, so a BSDF ray cannot find them either, and next
+    // event estimation is the *only* route they have.
+    if (wi.z < 0.0f) {
+        if (s.transmission <= 0.0f || s.alpha < PT_GGX_DELTA) {
+            return Spectrum(0.0f); // opaque, or a delta that a punctual light cannot land on
+        }
+
+        const float eta = s.front_face ? s.ior.x : 1.0f / s.ior.x;
+
+        // The microfacet that would refract wo into wi. Unlike a reflection's half vector this
+        // one is weighted by the index ratio, which is Snell's law written as a vector sum.
+        float3 wm = wo + wi * eta;
+        if (dot(wm, wm) <= 1e-12f) {
+            return Spectrum(0.0f);
+        }
+        wm = normalize(wm);
+        wm = wm.z < 0.0f ? -wm : wm;
+
+        // A microfacet facing away from either direction cannot be the one that scattered.
+        if (dot(wm, wi) * wi.z < 0.0f || dot(wm, wo) * wo.z < 0.0f) {
+            return Spectrum(0.0f);
+        }
+
+        const float transmitted = 1.0f - fresnel_dielectric(dot(wo, wm), eta);
+        if (transmitted <= 0.0f) {
+            return Spectrum(0.0f); // total internal reflection
+        }
+
+        // The Jacobian of the refraction, which is what makes a transmission lobe narrower or
+        // wider than the reflection lobe that shares its roughness.
+        const float partial = dot(wi, wm) + dot(wo, wm) / eta;
+        const float denom = partial * partial;
+
+        // f_t * cos(theta_i), with the cos(theta_i) cancelled against the one in f_t, and the
+        // same 1/eta^2 radiance compression the sampling path applies.
+        const float value = s.transmission * transmitted * ggx_d(wm, s.alpha) *
+                            smith_g2(wo, wi, s.alpha) *
+                            abs(dot(wi, wm) * dot(wo, wm)) /
+                            max(abs(wo.z) * denom * eta * eta, 1e-9f);
+        return Spectrum(value);
+    }
+
+    if (wi.z <= 0.0f) {
+        return Spectrum(0.0f); // exactly tangent, so nothing is scattered either way
+    }
+
+    const float opaque = 1.0f - s.transmission;
+
+    // The diffuse base, dimmed by whatever the specular layer above it reflects away.
+    const Spectrum reflected = fresnel_schlick(s.f0, wo.z);
+    Spectrum result = s.albedo * (opaque * (1.0f - s.metallic) * wi.z / PT_PI) *
+                      (Spectrum(1.0f) - reflected);
+
+    if (s.alpha >= PT_GGX_DELTA) {
+        const float3 h = normalize(wo + wi);
+        const float common = ggx_d(h, s.alpha) * smith_g2(wo, wi, s.alpha) /
+                             max(4.0f * wo.z, 1e-6f);
+
+        // f_spec * cos(theta_i) = F * D * G2 / (4 * cos(theta_o)); the cos(theta_i) in the
+        // denominator cancels against the one being multiplied in.
+        result += fresnel_schlick(s.f0, saturate(dot(wo, h))) * (opaque * common);
+
+        // The transmissive part still has a reflection lobe, and it is the one that puts a
+        // highlight on a glass surface. Only the rough case is worth evaluating: a smooth
+        // dielectric is a delta and a punctual light cannot land on it. The matching
+        // *transmission* lobe is handled above, for a light on the far side.
+        if (s.transmission > 0.0f) {
+            const float f = fresnel_dielectric(saturate(dot(wo, h)),
+                                               s.front_face ? s.ior.x : 1.0f / s.ior.x);
+            result += Spectrum(s.transmission * f * common);
+        }
+    }
+
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// sample, for the path
+// ---------------------------------------------------------------------------
+
+BsdfSample bsdf_sample(Surface s, float3 wo_world, inout Rng rng)
+{
+    BsdfSample result;
+    result.direction = float3(0.0f, 0.0f, 1.0f);
+    result.weight = Spectrum(0.0f);
+    result.specular = false;
+    result.transmitted = false;
+    result.dispersive = false;
+
+    const Frame f = frame_from_normal(s.normal);
+    const float3 wo = to_local(f, wo_world);
+    if (wo.z <= 0.0f) {
+        return result; // the ray arrived from behind the shading normal
+    }
+
+    // A transmissive material is a blend of two behaviours, so pick one and divide its
+    // probability back out. Any split is unbiased; this one has the property that a fully
+    // transmissive material never wastes a sample on a diffuse lobe it does not have.
+    if (s.transmission > 0.0f && rand(rng) < s.transmission) {
+        // The four wavelengths only refract together if the index is the same for all four.
+        const bool dispersive = s.ior.x != s.ior.y;
+        const float ior = s.ior.x; // the hero; the others are dropped by the caller
+        const float eta = s.front_face ? ior : 1.0f / ior;
+
+        // The microfacet the ray actually interacts with. A smooth surface interacts with the
+        // surface itself, which is the +z axis in this frame.
+        //
+        // The two draws are named rather than passed inline: argument evaluation order is
+        // unspecified, and sample_vndf's two arguments are not interchangeable. They stay
+        // inside the branch rather than being hoisted above it because a smooth surface must
+        // not consume them -- this was a short-circuiting ternary, and which draws happen has
+        // to stay exactly what it was or every glass path takes a different route.
+        float3 h = float3(0.0f, 0.0f, 1.0f);
+        if (s.alpha >= PT_GGX_DELTA) {
+            const float vndf_u1 = rand(rng);
+            const float vndf_u2 = rand(rng);
+            h = sample_vndf(wo, s.alpha, vndf_u1, vndf_u2);
+        }
+
+        // Work in a frame about the microfacet so the smooth and rough cases share one path.
+        const Frame hf = frame_from_normal(h);
+        const float3 wo_h = to_local(hf, wo);
+        if (wo_h.z <= 0.0f) {
+            return result;
+        }
+
+        const float fresnel = fresnel_dielectric(wo_h.z, eta);
+
+        float3 wi_h;
+        // Choosing reflection with exactly its Fresnel probability is what makes the Fresnel
+        // term cancel out of the weight entirely -- and it is also why total internal
+        // reflection needs no special case: fresnel_dielectric returns 1 and this always
+        // takes the reflecting branch.
+        if (rand(rng) < fresnel) {
+            wi_h = float3(-wo_h.x, -wo_h.y, wo_h.z);
+            result.transmitted = false;
+        } else if (refract_local(wo_h, eta, wi_h)) {
+            result.transmitted = true;
+            result.dispersive = dispersive;
+            // Radiance is compressed when it enters a denser medium and expanded on the way
+            // out. This factor is what keeps a slab of glass from brightening the world behind
+            // it; it is specific to transporting radiance rather than importance.
+            result.weight = Spectrum(1.0f / (eta * eta));
+        } else {
+            return result; // refract_local only fails where Fresnel already returned 1
+        }
+
+        const float3 wi = to_world(hf, wi_h);
+        // A microfacet can shadow the direction it scattered into.
+        const float masking = s.alpha < PT_GGX_DELTA
+                                  ? 1.0f
+                                  : smith_g2(wo, wi, s.alpha) /
+                                        max(smith_g1(wo, s.alpha), 1e-6f);
+
+        result.direction = to_world(f, wi);
+        result.weight = (result.transmitted ? result.weight : Spectrum(1.0f)) * masking;
+        result.specular = s.alpha < PT_GGX_DELTA;
+        return result;
+    }
+
+    const float p_specular = specular_probability(s);
+
+    if (rand(rng) < p_specular) {
+        float3 wi;
+        Spectrum weight;
+
+        if (s.alpha < PT_GGX_DELTA) {
+            // A delta lobe: one direction, and the pdf cancels exactly.
+            wi = float3(-wo.x, -wo.y, wo.z);
+            weight = fresnel_schlick(s.f0, wo.z);
+            result.specular = true;
+        } else {
+            // Named for the unspecified argument evaluation order; see the transmission
+            // branch above.
+            const float vndf_u1 = rand(rng);
+            const float vndf_u2 = rand(rng);
+            const float3 h = sample_vndf(wo, s.alpha, vndf_u1, vndf_u2);
+            wi = reflect(-wo, h);
+            if (wi.z <= 0.0f) {
+                return result; // reflected into the surface
+            }
+            // With visible-normal sampling the whole estimator collapses to this: the NDF and
+            // the sampling density cancel, leaving Fresnel times the ratio of the two-sided
+            // masking term to the one-sided one.
+            weight = fresnel_schlick(s.f0, saturate(dot(wo, h))) *
+                     (smith_g2(wo, wi, s.alpha) / max(smith_g1(wo, s.alpha), 1e-6f));
+        }
+
+        result.direction = to_world(f, wi);
+        result.weight = weight / p_specular;
+        return result;
+    }
+
+    // The diffuse lobe. A cosine-weighted direction against a Lambertian f makes f*cos/pdf
+    // collapse to the albedo, which is the whole reason for pairing the two.
+    const float u1 = rand(rng);
+    const float u2 = rand(rng);
+    const float r = sqrt(u1);
+    const float phi = 6.28318530718f * u2;
+    const float3 wi = float3(r * cos(phi), r * sin(phi), sqrt(max(0.0f, 1.0f - u1)));
+
+    const Spectrum reflected = fresnel_schlick(s.f0, wo.z);
+    result.direction = to_world(f, wi);
+    result.weight = s.albedo * ((1.0f - s.metallic) / (1.0f - p_specular)) *
+                    (Spectrum(1.0f) - reflected);
+    return result;
+}

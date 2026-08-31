@@ -1,0 +1,54 @@
+# pathtracer scene v1
+
+camera
+  position 2.28008 2.34865 9.51896
+  yaw 192.72
+  pitch -7.92
+  fov 42
+
+entity "ground"
+  shape       plane
+  translation 0 0 0
+  rotation    0 0 0
+  scale       11 1 11
+  albedo      0.58 0.58 0.6
+  roughness   1
+
+entity "bunny"
+  shape       bunny
+  translation -3.6 1.14 0
+  rotation    0 0 0
+  scale       1.15 1.15 1.15
+  albedo      0.82 0.8 0.76
+  roughness   0.92
+
+entity "dragon"
+  shape       dragon
+  translation 0 1.11858 -1.82969e-08
+  rotation    -90 0 0
+  scale       1.6 1.6 1.6
+  albedo      0.86 0.52 0.2
+  roughness   0.62
+
+entity "teapot"
+  shape       teapot
+  translation 3.6 0.636 0
+  rotation    0 0 0
+  scale       1.3 1.3 1.3
+  albedo      0.95 0.95 0.97
+  roughness   0.05
+
+light "key"
+  type      point
+  position  3.5 6 4.5
+  direction 0 -1 0
+  color     1 0.94 0.85
+  intensity 90
+
+light "fill"
+  type      area
+  position  -4 6.5 3
+  direction 0.35 -1 -0.25
+  color     0.72 0.82 1
+  intensity 9
+  size      2.5 2.5

@@ -2,3 +2,6 @@
 build
 compile_commands.json
 .cache
+assets
+__pycache__
+.claude

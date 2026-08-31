@@ -1,0 +1,65 @@
+# pathtracer scene v1
+
+camera
+  position 0.164028 2.7183 9.72559
+  yaw 181.8
+  pitch -2.76
+  fov 40
+
+entity "floor"
+  shape       cube
+  translation 0 -0.1 0
+  rotation    0 0 0
+  scale       2.75 0.1 2.75
+  albedo      0.73 0.73 0.73
+  roughness   1
+
+entity "ceiling"
+  shape       cube
+  translation 0 5.6 0
+  rotation    0 0 0
+  scale       2.75 0.1 2.75
+  albedo      0.73 0.73 0.73
+  roughness   1
+
+entity "back wall"
+  shape       cube
+  translation 0 2.75 -2.85
+  rotation    0 0 0
+  scale       2.75 2.85 0.1
+  albedo      0.73 0.73 0.73
+  roughness   1
+
+entity "left wall"
+  shape       cube
+  translation -2.85 2.75 0
+  rotation    0 0 0
+  scale       0.1 2.85 2.75
+  albedo      0.65 0.05 0.05
+  roughness   1
+
+entity "right wall"
+  shape       cube
+  translation 2.85 2.75 0
+  rotation    0 0 0
+  scale       0.1 2.85 2.75
+  albedo      0.12 0.45 0.15
+  roughness   1
+
+entity "short block"
+  shape       dragon
+  translation -0.00417161 1.99658 0.477707
+  rotation    -90 30 0
+  scale       3 3 3
+  albedo      0.73 0.73 0.73
+  roughness   1
+  transmission 0.05
+  ior         1
+
+light "ceiling panel"
+  type      area
+  position  0 5.45 0
+  direction 0 -1 0
+  color     1 0.85 0.68
+  intensity 14
+  size      0.75 0.75

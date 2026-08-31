@@ -1,0 +1,436 @@
+// Spectral rendering: wavelength sampling, RGB to spectrum upsampling, and the resolve back
+// to linear sRGB.
+//
+// The integrator carries radiance and throughput at four wavelengths rather than in three
+// colour channels. Everything else -- the authored albedo, the instance table, the payload --
+// stays RGB, and is upsampled at the point of use. That keeps the port off the GPU layer
+// entirely and leaves `unlit` working unchanged.
+//
+// Hero Wavelength Spectral Sampling, after Wilkie et al. 2014: one wavelength is drawn per
+// path and three more ride along at fixed rotations of it, so a single path carries four
+// correlated estimates instead of one. Far less colour noise than sampling one wavelength,
+// and it is the structure dispersion needs when a transmissive material eventually splits
+// them apart.
+//
+// Every table here is read through one buffer device address, whose layout is fixed by
+// src/spectral.h and produced by tools/bake_spectral.py. The offsets below are compile time
+// constants on both sides; pt_spectral_init refuses a blob whose header disagrees, which is
+// what makes that safe.
+
+typedef float4 Spectrum;
+
+static const float PT_LAMBDA_MIN = 360.0f;
+static const float PT_LAMBDA_MAX = 830.0f;
+static const float PT_LAMBDA_RANGE = 470.0f;
+static const uint PT_LAMBDA_COUNT = 471u;
+static const uint PT_SPECTRAL_RES = 64u;
+
+// Uniform over the visible range. Importance sampling toward the eye's response would waste
+// fewer samples in the near-ultraviolet and infrared tails, but it gives each of the four
+// wavelengths a *different* density, which turns the balance heuristic in spectral_resolve
+// from a no-op into something that has to be right. Uniform first, and correct; that is a
+// later and strictly local change.
+static const float PT_LAMBDA_PDF = 1.0f / PT_LAMBDA_RANGE;
+
+// Offsets into the table buffer, in floats. See the layout comment in src/spectral.h.
+static const uint PT_OFF_LUMINANCE = 0u;   // 3, the daylight basis luminances Y0/Y1/Y2
+static const uint PT_OFF_XYZ_TO_RGB = 3u;  // 9, row major
+static const uint PT_OFF_D65_M = 12u;      // 2, the (M1, M2) selecting D65 from the basis
+// The scale that gives a PT_SUN_KELVIN blackbody luminance 1. Computed on the CPU by
+// pt_spectral_blackbody_norm, because normalising a spectrum means integrating it against the
+// colour matching functions over 471 samples -- which is not something to do per ray.
+static const uint PT_OFF_SUN_NORM = 14u;
+static const uint PT_OFF_ZNODES = 15u;     // PT_SPECTRAL_RES
+static const uint PT_OFF_CMF = PT_OFF_ZNODES + PT_SPECTRAL_RES;
+static const uint PT_OFF_BASIS = PT_OFF_CMF + PT_LAMBDA_COUNT * 3u;
+static const uint PT_OFF_COEFF = PT_OFF_BASIS + PT_LAMBDA_COUNT * 3u;
+
+// ---------------------------------------------------------------------------
+// wavelengths
+// ---------------------------------------------------------------------------
+
+// The hero is uniform in [min, max); the other three are it rotated by whole quarters of the
+// range and wrapped. Rotation by a constant is a bijection on the interval, so each of the
+// four is *also* marginally uniform -- which is what lets a single constant stand in for all
+// four densities below.
+float4 hero_wavelengths(float u)
+{
+    float4 lambda;
+    [unroll]
+    for (uint j = 0u; j < 4u; ++j) {
+        const float offset = float(j) * (PT_LAMBDA_RANGE * 0.25f);
+        lambda[j] = PT_LAMBDA_MIN + fmod(u * PT_LAMBDA_RANGE + offset, PT_LAMBDA_RANGE);
+    }
+    return lambda;
+}
+
+// ---------------------------------------------------------------------------
+// table access
+// ---------------------------------------------------------------------------
+
+// Nearest sample rather than interpolated. The tables are at 1nm and the wavelengths are
+// continuous, so each entry stands for a 1nm bin and the estimator below is the trapezoidal
+// rule over exactly the same grid the baker integrated on -- which is what makes the two
+// agree about what a spectrum's luminance is.
+float3 curve_lookup(float *tables, uint offset, float lambda)
+{
+    const int index = clamp(int(round(lambda - PT_LAMBDA_MIN)), 0, int(PT_LAMBDA_COUNT) - 1);
+    const uint base = offset + uint(index) * 3u;
+    return float3(tables[base], tables[base + 1u], tables[base + 2u]);
+}
+
+float3 cie_xyz(float *tables, float lambda)
+{
+    return curve_lookup(tables, PT_OFF_CMF, lambda);
+}
+
+// S0, S1, S2 at one wavelength. Already scaled so that reconstructing at D65's chromaticity
+// gives an illuminant of luminance exactly 1 -- see tools/bake_spectral.py.
+float3 daylight_basis(float *tables, float lambda)
+{
+    return curve_lookup(tables, PT_OFF_BASIS, lambda);
+}
+
+float3x3 xyz_to_rgb_matrix(float *tables)
+{
+    const uint b = PT_OFF_XYZ_TO_RGB;
+    return float3x3(tables[b + 0u], tables[b + 1u], tables[b + 2u],
+                    tables[b + 3u], tables[b + 4u], tables[b + 5u],
+                    tables[b + 6u], tables[b + 7u], tables[b + 8u]);
+}
+
+// ---------------------------------------------------------------------------
+// RGB -> reflectance (Jakob & Hanika 2019)
+// ---------------------------------------------------------------------------
+//
+//   s(t) = c0*t^2 + c1*t + c2,   t = (lambda - 360) / 470
+//   S(t) = 1/2 + s / (2*sqrt(1 + s^2))
+//
+// Note the t basis: the published form uses lambda in nanometres, where c0 is around 1e-5 and
+// the quadratic is a sum of large near-cancelling terms -- catastrophic cancellation in fp32.
+// A table baked for one form cannot be read by the other.
+
+Spectrum sigmoid_spectrum(float3 coefficients, float4 lambda)
+{
+    const float4 t = (lambda - PT_LAMBDA_MIN) * (1.0f / PT_LAMBDA_RANGE);
+    const float4 s = (coefficients.x * t + coefficients.y) * t + coefficients.z;
+    return 0.5f + 0.5f * s * rsqrt(1.0f + s * s);
+}
+
+float3 coefficient_at(float *tables, uint slice, uint level, uint iy, uint ix)
+{
+    const uint index =
+        ((slice * PT_SPECTRAL_RES + level) * PT_SPECTRAL_RES + iy) * PT_SPECTRAL_RES + ix;
+    const uint base = PT_OFF_COEFF + index * 3u;
+    return float3(tables[base], tables[base + 1u], tables[base + 2u]);
+}
+
+// The largest-component axis rides a non-uniform scale, so the bracketing pair has to be
+// searched for rather than indexed. Six steps over 64 nodes, fully unrolled.
+uint find_z_level(float *tables, float z)
+{
+    uint low = 0u;
+    uint high = PT_SPECTRAL_RES - 1u;
+    [unroll]
+    for (uint step = 0u; step < 6u; ++step) {
+        const uint mid = (low + high + 1u) / 2u;
+        if (tables[PT_OFF_ZNODES + mid] <= z) {
+            low = mid;
+        } else {
+            high = mid - 1u;
+        }
+    }
+    return min(low, PT_SPECTRAL_RES - 2u);
+}
+
+// Trilinear over (z, y ratio, x ratio) within the slice the largest channel selects. The
+// three slices cover the unit cube exactly once between them.
+float3 upsample_coefficients(float *tables, float3 rgb)
+{
+    const float3 c = clamp(rgb, 0.0f, 1.0f);
+
+    uint slice = 0u;
+    float z = c.x;
+    if (c.y > z) {
+        slice = 1u;
+        z = c.y;
+    }
+    if (c.z > z) {
+        slice = 2u;
+        z = c.z;
+    }
+
+    if (z <= 1e-6f) {
+        // Black is unrepresentable -- it wants the sigmoid driven to minus infinity -- so
+        // pin it far enough negative that the spectrum is zero to well past float precision.
+        return float3(0.0f, 0.0f, -50.0f);
+    }
+
+    const float3 rotated = slice == 0u ? float3(c.y, c.z, 0.0f)
+                                       : (slice == 1u ? float3(c.z, c.x, 0.0f)
+                                                      : float3(c.x, c.y, 0.0f));
+    const float x_ratio = rotated.x / z;
+    const float y_ratio = rotated.y / z;
+
+    const uint level = find_z_level(tables, z);
+    const float low = tables[PT_OFF_ZNODES + level];
+    const float span = tables[PT_OFF_ZNODES + level + 1u] - low;
+    const float tz = span > 0.0f ? saturate((z - low) / span) : 0.0f;
+
+    // The ratio axes are uniform in [0,1].
+    const float fy = y_ratio * float(PT_SPECTRAL_RES - 1u);
+    const float fx = x_ratio * float(PT_SPECTRAL_RES - 1u);
+    const uint iy = uint(clamp(floor(fy), 0.0f, float(PT_SPECTRAL_RES - 2u)));
+    const uint ix = uint(clamp(floor(fx), 0.0f, float(PT_SPECTRAL_RES - 2u)));
+    const float ty = saturate(fy - float(iy));
+    const float tx = saturate(fx - float(ix));
+
+    const float3 c000 = coefficient_at(tables, slice, level, iy, ix);
+    const float3 c001 = coefficient_at(tables, slice, level, iy, ix + 1u);
+    const float3 c010 = coefficient_at(tables, slice, level, iy + 1u, ix);
+    const float3 c011 = coefficient_at(tables, slice, level, iy + 1u, ix + 1u);
+    const float3 c100 = coefficient_at(tables, slice, level + 1u, iy, ix);
+    const float3 c101 = coefficient_at(tables, slice, level + 1u, iy, ix + 1u);
+    const float3 c110 = coefficient_at(tables, slice, level + 1u, iy + 1u, ix);
+    const float3 c111 = coefficient_at(tables, slice, level + 1u, iy + 1u, ix + 1u);
+
+    return lerp(lerp(lerp(c000, c001, tx), lerp(c010, c011, tx), ty),
+                lerp(lerp(c100, c101, tx), lerp(c110, c111, tx), ty), tz);
+}
+
+// An authored [0,1] colour as a reflectance spectrum.
+Spectrum upsample_reflectance(float *tables, float3 rgb, float4 lambda)
+{
+    return sigmoid_spectrum(upsample_coefficients(tables, rgb), lambda);
+}
+
+// ---------------------------------------------------------------------------
+// illuminants
+// ---------------------------------------------------------------------------
+
+// D65, reconstructed from the same basis the sky uses. Scaled so a perfect white reflector
+// under it has luminance exactly 1, which is what makes an authored colour resolve back to
+// itself and every existing scene keep its exposure.
+Spectrum illuminant_d65(float *tables, float4 lambda)
+{
+    const float m1 = tables[PT_OFF_D65_M];
+    const float m2 = tables[PT_OFF_D65_M + 1u];
+
+    Spectrum result;
+    [unroll]
+    for (uint j = 0u; j < 4u; ++j) {
+        const float3 s = daylight_basis(tables, lambda[j]);
+        result[j] = s.x + m1 * s.y + m2 * s.z;
+    }
+    return result;
+}
+
+// Planck's law with the 2hc^2 prefactor dropped: the CPU side hands over a normalisation that
+// absorbs it, so this only has to be right up to a constant. c2 = hc/k = 1.4387769e7 nm.K,
+// the CIE second radiation constant. Mirrored by pt_spectral_blackbody_norm in src/spectral.c,
+// which integrates this very shape against the very same colour matching functions.
+// Mirrors PT_SPECTRAL_SUN_KELVIN in src/spectral.h.
+static const float PT_SUN_KELVIN = 5778.0f;
+
+Spectrum planck_shape(float4 lambda, float kelvin)
+{
+    const float4 l2 = lambda * lambda;
+    const float4 l5 = l2 * l2 * lambda;
+    return 1.0f / (l5 * (exp(1.4387769e7f / (lambda * kelvin)) - 1.0f));
+}
+
+// An emitter's authored colour and brightness as a spectrum.
+//
+// The colour is treated as a reflectance under the illuminant, which is what makes it resolve
+// back to exactly what was authored. Brightness is split off first because the upsampling LUT
+// is only defined on the unit cube while emission is unbounded -- a spectrum scales linearly,
+// so the peak can be factored out and multiplied back with no error.
+Spectrum upsample_emission(float *tables, float3 rgb, Spectrum illuminant, float4 lambda)
+{
+    const float peak = max(max(rgb.r, rgb.g), rgb.b);
+    if (peak <= 0.0f) {
+        return Spectrum(0.0f);
+    }
+    return upsample_reflectance(tables, rgb / peak, lambda) * illuminant * peak;
+}
+
+// ---------------------------------------------------------------------------
+// sky
+//
+// Preetham et al. 1999, "A Practical Analytic Model for Daylight". The model produces xyY,
+// and the route from there to a spectrum is the CIE D-series basis: a chromaticity selects
+// (M1, M2), and those weight the same S0/S1/S2 the default illuminant is built from.
+//
+// That is sound but approximate, and the approximation is worth naming: the D-series is only
+// strictly valid on or near the daylight locus. Preetham's sky chromaticities sit close to it
+// over most of the hemisphere but wander off near the horizon and at high turbidity, where the
+// reconstruction can go slightly negative and the weights can blow up. Both are handled below,
+// and the *luminance* stays exact regardless, which is what governs image brightness.
+//
+// The coefficients are transcribed from the paper's appendix and cross-checked against a
+// published implementation. There is no way to eyeball a wrong digit here, so if the sky ever
+// looks wrong, suspect these before anything else.
+// ---------------------------------------------------------------------------
+
+// The (M1, M2) selecting the CIE D illuminant of chromaticity (x, y). CIE 15.
+float2 daylight_weights(float x, float y)
+{
+    // The denominator is only about 0.0034 *on* the locus, so it is small even where the model
+    // is valid and can cross zero just off it. Floor its magnitude, then clamp the results:
+    // an unclamped weight here scales the whole spectrum and turns one bad pixel into a
+    // firefly that no amount of accumulation removes. The bounds are heuristic, chosen well
+    // outside the range CIE tabulates for 4000K..25000K.
+    float d = 0.0241f + 0.2562f * x - 0.7341f * y;
+    d = abs(d) < 1e-4f ? (d < 0.0f ? -1e-4f : 1e-4f) : d;
+
+    return clamp(float2((-1.3515f - 1.7703f * x + 5.9114f * y) / d,
+                        (0.0300f - 31.4424f * x + 30.0717f * y) / d),
+                 -8.0f, 8.0f);
+}
+
+// How much of the sky a matte ground reflects back, used only below the horizon. Not a
+// physical parameter of Preetham's model -- it stands in for the world outside the scene.
+static const float PT_SKY_GROUND_ALBEDO = 0.3f;
+
+// Perez's five parameter luminance distribution, shared by all three xyY channels.
+// The 0.01 guards the horizon, where cos(theta) reaches zero and the exponent diverges.
+float perez(float cos_theta, float gamma, float a, float b, float c, float d, float e)
+{
+    const float cos_gamma = cos(gamma);
+    return (1.0f + a * exp(b / (cos_theta + 0.01f))) *
+           (1.0f + c * exp(d * gamma) + e * cos_gamma * cos_gamma);
+}
+
+// Turbidity to the Perez coefficients. Each float3 is (x, y, Y) -- the two chromaticity
+// channels and the luminance one.
+struct PerezCoefficients {
+    float3 a, b, c, d, e;
+};
+
+PerezCoefficients perez_coefficients(float turbidity)
+{
+    PerezCoefficients p;
+    p.a = float3(-0.0193f, -0.0167f, 0.1787f) * turbidity + float3(-0.2592f, -0.2608f, -1.4630f);
+    p.b = float3(-0.0665f, -0.0950f, -0.3554f) * turbidity + float3(0.0008f, 0.0092f, 0.4275f);
+    p.c = float3(-0.0004f, -0.0079f, -0.0227f) * turbidity + float3(0.2125f, 0.2102f, 5.3251f);
+    p.d = float3(-0.0641f, -0.0441f, 0.1206f) * turbidity + float3(-0.8989f, -1.6537f, -2.5771f);
+    p.e = float3(-0.0033f, -0.0109f, -0.0670f) * turbidity + float3(0.0452f, 0.0529f, 0.3703f);
+    return p;
+}
+
+// Zenith chromaticity: a cubic in the sun's zenith angle, quadratic in turbidity.
+float zenith_chromaticity(float4 c0, float4 c1, float4 c2, float sun_theta, float turbidity)
+{
+    const float4 theta = float4(sun_theta * sun_theta * sun_theta, sun_theta * sun_theta,
+                                sun_theta, 1.0f);
+    return dot(float3(turbidity * turbidity, turbidity, 1.0f),
+               float3(dot(theta, c0), dot(theta, c1), dot(theta, c2)));
+}
+
+// Preetham's sky as a spectrum, for a view direction and a sun direction.
+//
+// `scale` converts the model's kcd/m^2 into the renderer's own linear units. There is no
+// tonemapper here to absorb a mismatch, so it is an explicit, empirically chosen constant
+// rather than something hidden inside the model.
+Spectrum preetham_sky(float *tables, float3 dir, float3 sun_dir, float turbidity, float scale,
+                      float4 lambda)
+{
+    const PerezCoefficients p = perez_coefficients(turbidity);
+
+    // Below the horizon the model has nothing to say, and neither of the two obvious answers
+    // is good enough. Extending the horizon downwards floods the lower hemisphere with the
+    // *brightest* part of the sky and lights every scene from beneath; fading to black leaves
+    // a hard band wherever the scene's own ground plane runs out. So stand in a dim diffuse
+    // ground: the zenith's radiance scaled by a matte albedo, which is roughly what a floor
+    // reflects back, blended over a couple of degrees so there is no seam.
+    const float above = saturate(dir.y / 0.02f);
+    const float cos_theta = max(dir.y, 0.001f);
+    const float sun_cos_theta = clamp(sun_dir.y, 0.0f, 1.0f);
+    const float sun_theta = acos(sun_cos_theta);
+    const float gamma = acos(clamp(dot(dir, sun_dir), -1.0f, 1.0f));
+
+    const float chi = (4.0f / 9.0f - turbidity / 120.0f) * (3.14159265358979f - 2.0f * sun_theta);
+
+    float3 zenith;
+    zenith.x = zenith_chromaticity(float4(0.00166f, -0.00375f, 0.00209f, 0.0f),
+                                   float4(-0.02903f, 0.06377f, -0.03202f, 0.00394f),
+                                   float4(0.11693f, -0.21196f, 0.06052f, 0.25886f),
+                                   sun_theta, turbidity);
+    zenith.y = zenith_chromaticity(float4(0.00275f, -0.00610f, 0.00317f, 0.0f),
+                                   float4(-0.04214f, 0.08970f, -0.04153f, 0.00516f),
+                                   float4(0.15346f, -0.26756f, 0.06670f, 0.26688f),
+                                   sun_theta, turbidity);
+    zenith.z = (4.0453f * turbidity - 4.9710f) * tan(chi) - 0.2155f * turbidity + 2.4192f;
+
+    // The model gives a *ratio* to the zenith, so each channel is its zenith value scaled by
+    // the distribution here over the distribution straight up.
+    float3 xyY;
+    [unroll]
+    for (uint i = 0u; i < 3u; ++i) {
+        const float here = perez(cos_theta, gamma, p.a[i], p.b[i], p.c[i], p.d[i], p.e[i]);
+        const float up = perez(1.0f, sun_theta, p.a[i], p.b[i], p.c[i], p.d[i], p.e[i]);
+        xyY[i] = zenith[i] * here / max(up, 1e-4f);
+    }
+
+    // The ground stands in below the horizon; above it this lerp is a no-op.
+    xyY.z = lerp(zenith.z * PT_SKY_GROUND_ALBEDO, xyY.z, above);
+
+    const float luminance = max(xyY.z, 0.0f) * scale;
+    if (luminance <= 0.0f) {
+        return Spectrum(0.0f);
+    }
+
+    // Chromaticity to a spectrum through the daylight basis. The basis is stored already
+    // normalised, so its own luminance -- a dot product against three baked constants rather
+    // than a spectral integral per ray -- is exactly what rescales it to the target.
+    const float2 m = daylight_weights(xyY.x, xyY.y);
+    const float3 basis_luminance = float3(tables[PT_OFF_LUMINANCE], tables[PT_OFF_LUMINANCE + 1u],
+                                          tables[PT_OFF_LUMINANCE + 2u]);
+    const float own = dot(basis_luminance, float3(1.0f, m.x, m.y));
+
+    Spectrum result;
+    [unroll]
+    for (uint j = 0u; j < 4u; ++j) {
+        const float3 s = daylight_basis(tables, lambda[j]);
+        result[j] = s.x + m.x * s.y + m.y * s.z;
+    }
+
+    // Off the daylight locus the reconstruction can dip below zero, which is unphysical and
+    // would subtract light from the image.
+    return max(result, 0.0f) * (luminance / max(own, 1e-4f));
+}
+
+// ---------------------------------------------------------------------------
+// resolve
+// ---------------------------------------------------------------------------
+
+// Four spectral samples to linear sRGB.
+//
+// `pdf` is the density of this path under each of the four possible hero choices. Dividing by
+// their mean rather than by each lane's own density is the balance heuristic over those
+// choices (Wilkie et al. 2014, single sample model). Every sampling decision in the integrator
+// is currently wavelength independent, so all four entries are the same constant and this
+// collapses to the ordinary estimator -- but dispersion is exactly what will make them differ,
+// and when it does this line already does the right thing.
+float3 spectral_resolve(float *tables, float4 lambda, Spectrum radiance, float4 pdf)
+{
+    const float mean_pdf = 0.25f * (pdf.x + pdf.y + pdf.z + pdf.w);
+    const float4 weighted = radiance / max(mean_pdf, 1e-12f);
+
+    float3 xyz = float3(0.0f);
+    [unroll]
+    for (uint j = 0u; j < 4u; ++j) {
+        xyz += cie_xyz(tables, lambda[j]) * weighted[j];
+    }
+    xyz *= 0.25f; // the average over the four samples
+
+    return mul(xyz_to_rgb_matrix(tables), xyz);
+}
+
+// The spectral analogue of the component max the RGB integrator used for Russian roulette.
+// Never smaller than any single lane, so it cannot terminate a path that is still carrying a
+// bright wavelength.
+float spectrum_max(Spectrum s)
+{
+    return max(max(s.x, s.y), max(s.z, s.w));
+}

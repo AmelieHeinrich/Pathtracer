@@ -1,0 +1,97 @@
+# pathtracer scene v1
+
+camera
+  position 3.6965 1.87834 3.37576
+  yaw 225.48
+  pitch -8.52
+  fov 40
+
+entity "floor"
+  shape       cube
+  translation 0 -0.1 0
+  rotation    0 0 0
+  scale       6.09824 0.1 5.8502
+  albedo      0.95302 0.936494 0.936494
+  roughness   1
+
+entity "ceiling"
+  shape       cube
+  translation 0 5.6 0
+  rotation    0 0 0
+  scale       2.75 0.1 2.75
+  albedo      0.73 0.73 0.73
+  roughness   1
+
+entity "back wall"
+  shape       cube
+  translation 0 2.75 -3.79445
+  rotation    0 0 0
+  scale       6.35777 2.85 0.1
+  albedo      0.00768126 0.201626 0.66443
+  roughness   0.05
+  metallic    1
+
+entity "left wall"
+  shape       cube
+  translation -4.5004 2.75 0
+  rotation    0 0 0
+  scale       0.1 2.85 7.06169
+  albedo      0.65 0.05 0.05
+  roughness   0.05
+  metallic    1
+
+entity "right wall"
+  shape       cube
+  translation 3.83234 2.75 0
+  rotation    0 0 0
+  scale       0.1 2.85 6.04568
+  albedo      0.12 0.45 0.15
+  roughness   0.05
+  metallic    1
+
+entity "short block"
+  shape       dragon
+  translation -1.31832 1.02202 -0.964003
+  rotation    -90 30 0
+  scale       1.5 1.5 1.5
+  albedo      0.951258 0.950654 0.973154
+  roughness   0.25
+  transmission 1
+  ior         1.52
+  absorption  0.00523722 0.90604 0.633986
+  absorption_distance 1
+
+entity "bunny"
+  shape       bunny
+  translation 1.34308 0.994086 -0.783298
+  rotation    0 0 0
+  scale       1 1 1
+  albedo      1 0.76 0.33
+  roughness   0.05
+  metallic    1
+
+entity "teapot"
+  shape       teapot
+  translation 0 0.58799 1.2064
+  rotation    0 -22.5989 0
+  scale       1.2 1.2 1.2
+  albedo      0.892617 0.887458 0.887458
+  roughness   0.3
+  metallic    1
+
+entity "cube"
+  shape       cube
+  translation 0 0 4.09673
+  rotation    0 0 0
+  scale       7.30211 4.88903 0.10572
+  albedo      0.7 0.7 0.7
+  roughness   0.05
+  metallic    1
+
+light "ceiling panel"
+  type      area
+  position  0 5.45 0
+  direction 0 -1 0
+  color     0.993289 0.95561 0.912907
+  intensity 20
+  size      0.75 0.75

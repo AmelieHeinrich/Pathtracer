@@ -28,5 +28,9 @@ void pt_fly_camera_init(pt_fly_camera_t *camera, const float position[3], float 
 // Applies a frame of input and returns the camera to render with. `dt` is in seconds.
 // `blocked` suppresses input entirely, for when the UI or a gizmo owns the mouse; the camera
 // is still returned so the caller always has one. `scroll` adjusts the movement speed.
+// `aperture` and `focus_distance` are passed straight through to pt_camera_look_at, the same
+// way `fov_degrees` is: all three are authored on the scene rather than owned by the camera,
+// which only knows where it is and where it is looking.
 pt_camera_t pt_fly_camera_update(pt_fly_camera_t *camera, GLFWwindow *window, float dt,
-                                 float fov_degrees, float scroll, bool blocked);
+                                 float fov_degrees, float aperture, float focus_distance,
+                                 float scroll, bool blocked);

@@ -560,9 +560,10 @@ static bool property_color(struct nk_context *ctx, const char *label, float rgb[
 static void scene_list(struct nk_context *ctx, pt_scene_t *scene, gizmo_selection_t *selection)
 {
     nk_layout_row_dynamic(ctx, 22.0f, 2);
-    if (nk_combo_begin_label(ctx, "Add shape", nk_vec2(160.0f, 200.0f))) {
+    // Tall enough for the analytic shapes plus a few baked models before it has to scroll.
+    if (nk_combo_begin_label(ctx, "Add shape", nk_vec2(160.0f, 260.0f))) {
         nk_layout_row_dynamic(ctx, 22.0f, 1);
-        for (uint32_t i = 0; i < PT_SHAPE_COUNT; ++i) {
+        for (uint32_t i = 0; i < pt_shape_count(); ++i) {
             if (nk_combo_item_label(ctx, pt_shape_name((pt_shape_t)i), NK_TEXT_LEFT)) {
                 if (pt_scene_add_entity(scene, (pt_shape_t)i)) {
                     // Select what was just added: the next thing anyone wants is to place it.
@@ -641,9 +642,9 @@ static void entity_properties(struct nk_context *ctx, pt_scene_t *scene, uint32_
                                                 sizeof(entity->name), nk_filter_default) &
                  NK_EDIT_ACTIVE) != 0;
 
-    if (nk_combo_begin_label(ctx, pt_shape_name(entity->shape), nk_vec2(200.0f, 200.0f))) {
+    if (nk_combo_begin_label(ctx, pt_shape_name(entity->shape), nk_vec2(200.0f, 260.0f))) {
         nk_layout_row_dynamic(ctx, 22.0f, 1);
-        for (uint32_t i = 0; i < PT_SHAPE_COUNT; ++i) {
+        for (uint32_t i = 0; i < pt_shape_count(); ++i) {
             if (nk_combo_item_label(ctx, pt_shape_name((pt_shape_t)i), NK_TEXT_LEFT) &&
                 entity->shape != (pt_shape_t)i) {
                 entity->shape = (pt_shape_t)i;
@@ -665,6 +666,19 @@ static void entity_properties(struct nk_context *ctx, pt_scene_t *scene, uint32_
     changed |= property_float(ctx, "Emission strength", &entity->emission_strength, 0.0f,
                               1000.0f, 0.25f);
     changed |= property_float(ctx, "Roughness", &entity->roughness, 0.0f, 1.0f, 0.01f);
+    // 0 is a dielectric, 1 a conductor. In between is not physical -- no real surface is
+    // half a metal -- but it is the standard authoring control and it is what makes worn or
+    // partly-oxidised surfaces easy to dial in.
+    changed |= property_float(ctx, "Metallic", &entity->metallic, 0.0f, 1.0f, 0.01f);
+    changed |= property_float(ctx, "Transmission", &entity->transmission, 0.0f, 1.0f, 0.01f);
+    changed |= property_float(ctx, "IOR", &entity->ior, 1.0f, 3.0f, 0.01f);
+    // 0 means no dispersion. Real glasses live between about 20 and 65, so the useful part of
+    // this slider is a long way from its left end.
+    changed |= property_float(ctx, "Abbe", &entity->abbe, 0.0f, 80.0f, 0.5f);
+    // The colour reached after `Absorb dist` of travel through the material. White is inert.
+    changed |= property_color(ctx, "Absorption", entity->absorption);
+    changed |= property_float(ctx, "Absorb dist", &entity->absorption_distance, 0.01f, 100.0f,
+                              0.05f);
 
     if (changed) {
         ++scene->revision;
@@ -707,6 +721,12 @@ static void light_properties(struct nk_context *ctx, pt_scene_t *scene, uint32_t
     changed |= property_color(ctx, "Color", light->color);
     changed |= property_float(ctx, "Intensity", &light->intensity, 0.0f, 10000.0f, 1.0f);
     changed |= property_float(ctx, "Range", &light->range, 0.0f, 1000.0f, 0.5f);
+    // 0 is the "no temperature" sentinel rather than a real Kelvin value, so the slider stops
+    // at 1000 and the step down to 0 is deliberate. A blackbody changes only the hue -- the
+    // normalisation in fill_light holds the luminance -- so this can be swept without the
+    // exposure moving under you.
+    changed |= property_float(ctx, "Temperature K", &light->temperature, 0.0f, 12000.0f,
+                              50.0f);
     if (light->type == PT_LIGHT_AREA) {
         nk_layout_row_dynamic(ctx, 16.0f, 1);
         nk_label(ctx, "Size (half extents)", NK_TEXT_LEFT);
@@ -731,15 +751,46 @@ static void light_properties(struct nk_context *ctx, pt_scene_t *scene, uint32_t
     }
 }
 
+// Works around a regression in nuklear 4.13.0 ("Fix: nk_property not updating
+// 'win->edit.active'" in its own changelog). When a number field starts being edited,
+// nk_property now sets win->edit.active -- but it never touches win->edit.name, which still
+// holds the identity of whichever text field was last focused in this window. nk_edit_buffer
+// decides whether a text field is the focused one with
+//
+//     hash = win->edit.seq++;
+//     if (win->edit.active && hash == win->edit.name) ...
+//
+// so that text field quietly reactivates itself and consumes the very keystrokes being typed
+// into the number: the digits land in the entity's name as well, and neither field ends up
+// holding what was typed. win->edit.name is zero until something is focused, which is why even
+// a fresh session sees it -- the first text field in the window hashes to zero too.
+//
+// A property and a text field can never both legitimately be editing, since they share the one
+// ctx->text_edit, so a live property means no text field owns the keyboard. Saying that before
+// the window lays out any edit widget is the whole fix; nk_property sets the flag again on the
+// next frame it wants it. Nothing else reads it -- nk_item_is_any_active goes by hover and the
+// last widget state -- so the camera still stays put while a number is being typed.
+static void clear_property_edit_collision(struct nk_context *ctx)
+{
+    struct nk_window *win = ctx->current;
+    if (win && win->property.active) {
+        win->edit.active = nk_false;
+    }
+}
+
 static void scene_window(ui_t *ui, renderer_t *renderer, gizmo_selection_t *selection,
                          gizmo_t *gizmo)
 {
     struct nk_context *ctx = &ui->context;
     pt_scene_t *scene = &renderer->scene;
 
-    if (nk_begin(ctx, "Scene", nk_rect(20.0f, 300.0f, 300.0f, 460.0f),
+    if (nk_begin(ctx, "Scene", nk_rect(20.0f, 300.0f, 300.0f, 620.0f),
                  NK_WINDOW_BORDER | NK_WINDOW_MOVABLE | NK_WINDOW_SCALABLE |
                      NK_WINDOW_MINIMIZABLE | NK_WINDOW_TITLE)) {
+        // This window is the one that mixes text fields with number fields, so it is the one
+        // that can hit the collision above. Has to come before the first edit widget.
+        clear_property_edit_collision(ctx);
+
         nk_layout_row_dynamic(ctx, 22.0f, 1);
         ui->editing_text |= (nk_edit_string(ctx, NK_EDIT_FIELD, ui->scene_path,
                                             &ui->scene_path_length, UI_PATH_MAX - 1,
@@ -791,7 +842,9 @@ void ui_draw_overlay(ui_t *ui, renderer_t *renderer, gizmo_selection_t *selectio
 
     scene_window(ui, renderer, selection, gizmo);
 
-    if (nk_begin(ctx, "Pathtracer", nk_rect(20.0f, 20.0f, 280.0f, 250.0f),
+    // Tall enough for every row below: the panel has no scrollbar, so anything that does not
+    // fit is simply unreachable.
+    if (nk_begin(ctx, "Pathtracer", nk_rect(20.0f, 20.0f, 280.0f, 640.0f),
                  NK_WINDOW_BORDER | NK_WINDOW_MOVABLE | NK_WINDOW_MINIMIZABLE |
                      NK_WINDOW_TITLE | NK_WINDOW_NO_SCROLLBAR)) {
         const float fps = ui->frame_ms > 0.0f ? 1000.0f / ui->frame_ms : 0.0f;
@@ -837,9 +890,106 @@ void ui_draw_overlay(ui_t *ui, renderer_t *renderer, gizmo_selection_t *selectio
         nk_property_float(ctx, "Sky", 0.0f, &renderer->settings.sky_intensity, 4.0f, 0.05f,
                           0.02f);
 
+        // The Preetham sky's own parameters. Turbidity is floored at 1.7 because the model is
+        // a fit and goes visibly wrong below that -- the fit had no data there.
+        nk_property_float(ctx, "Turbidity", 1.7f, &renderer->settings.turbidity, 10.0f, 0.1f,
+                          0.05f);
+        // Below the horizon the sky is replaced by a stand-in ground, so negative elevations
+        // are allowed but only interesting near zero.
+        nk_property_float(ctx, "Sun elevation", -5.0f, &renderer->settings.sun_elevation, 90.0f,
+                          1.0f, 0.5f);
+        nk_property_float(ctx, "Sun azimuth", 0.0f, &renderer->settings.sun_azimuth, 360.0f,
+                          1.0f, 0.5f);
+        // 0.53 is the real sun. Larger softens the shadow edges without changing how much
+        // light arrives, because sun_radiance normalises by the disc's solid angle.
+        nk_property_float(ctx, "Sun size", 0.1f, &renderer->settings.sun_angular_diameter,
+                          20.0f, 0.1f, 0.05f);
+
         renderer->settings.unlit = unlit ? 1u : 0u;
         renderer->settings.max_bounces = (uint32_t)bounces;
         renderer->settings.samples_per_frame = (uint32_t)samples;
+
+        // The a-trous filter. A post-process over the already averaged image, so like the
+        // view toggles above -- and unlike everything between them -- it lives outside
+        // pt_settings_t and never restarts the accumulation. Reach for it when glass or
+        // dispersion has left grain the estimator is converging out only slowly.
+        nk_layout_row_dynamic(ctx, 8.0f, 1);
+        nk_spacing(ctx, 1);
+        nk_layout_row_dynamic(ctx, 22.0f, 1);
+        nk_label(ctx, "Denoise", NK_TEXT_LEFT);
+
+        denoise_settings_t *denoise = &renderer->denoise.settings;
+        int denoise_on = denoise->enabled;
+        int iterations = (int)denoise->iterations;
+        nk_checkbox_label(ctx, "Enabled", &denoise_on);
+        // Each pass doubles the tap spacing, so five reaches a 65 pixel support. Past that
+        // the widest taps are further apart than most of what is on screen.
+        nk_property_int(ctx, "Iterations", 1, &iterations, 5, 1, 0.05f);
+        // How far two pixels may differ in brightness before they stop filtering each other.
+        // Small keeps detail and noise alike; large flattens both.
+        nk_property_float(ctx, "Colour phi", 0.01f, &denoise->phi_color, 4.0f, 0.05f, 0.01f);
+        // An exponent on the cosine between normals, so it is only interesting at this scale.
+        nk_property_float(ctx, "Normal phi", 1.0f, &denoise->phi_normal, 128.0f, 1.0f, 0.5f);
+        // World units, and scaled by the tap spacing inside the shader.
+        nk_property_float(ctx, "Depth phi", 0.001f, &denoise->phi_depth, 1.0f, 0.005f, 0.002f);
+        denoise->enabled = denoise_on != 0;
+        denoise->iterations = (uint32_t)iterations;
+
+        // Tonemapping. A post-process like the denoiser above, and outside pt_settings_t for
+        // the same reason: it shapes the averaged image rather than changing what is averaged.
+        nk_layout_row_dynamic(ctx, 8.0f, 1);
+        nk_spacing(ctx, 1);
+        nk_layout_row_dynamic(ctx, 22.0f, 1);
+        nk_label(ctx, "Tonemap", NK_TEXT_LEFT);
+
+        tonemap_settings_t *tonemap = &renderer->tonemap.settings;
+        int tonemap_on = tonemap->enabled;
+        nk_checkbox_label(ctx, "Enabled", &tonemap_on);
+        tonemap->enabled = tonemap_on != 0;
+
+        // "None" is the naked clip the renderer applied before this pass existed, kept so the
+        // spectral work can still be judged against an image nothing has shaped.
+        const int picked = nk_combo(ctx, TONEMAP_CURVE_NAMES, (int)TONEMAP_CURVE_COUNT,
+                                    (int)tonemap->curve, 22, nk_vec2(nk_widget_width(ctx), 120.0f));
+        tonemap->curve = (tonemap_curve_t)picked;
+
+        // Stops, so 0 leaves the scene at the brightness it was authored for.
+        nk_property_float(ctx, "Exposure", -8.0f, &tonemap->exposure, 8.0f, 0.1f, 0.05f);
+
+        // The lens. Unlike the two blocks above these *are* scene data -- they save into the
+        // .pts alongside the field of view, and changing either restarts the accumulation by
+        // itself, because pt_camera_t is part of what renderer_record compares.
+        nk_layout_row_dynamic(ctx, 8.0f, 1);
+        nk_spacing(ctx, 1);
+        nk_layout_row_dynamic(ctx, 22.0f, 1);
+        nk_label(ctx, "Camera", NK_TEXT_LEFT);
+
+        // 0 is a pinhole, so the whole effect switches off at the bottom of the range rather
+        // than needing a checkbox of its own.
+        nk_property_float(ctx, "Aperture", 0.0f, &renderer->scene.camera_aperture, 1.0f, 0.005f,
+                          0.002f);
+        nk_property_float(ctx, "Focus dist", 0.1f, &renderer->scene.camera_focus_distance,
+                          100.0f, 0.1f, 0.05f);
+
+        // Pulling focus by hand means guessing a distance and watching what sharpens; this
+        // reads it off the selection instead. Straight-line distance rather than distance
+        // along the view axis: the thing being focused on is normally what is being looked
+        // at, and where it is not, the straight line is the more useful of the two.
+        nk_layout_row_dynamic(ctx, 26.0f, 1);
+        if (nk_button_label(ctx, "Focus on selection")) {
+            const float *target = NULL;
+            if (selection->target == GIZMO_TARGET_ENTITY &&
+                selection->index < renderer->scene.entity_count) {
+                target = renderer->scene.entities[selection->index].translation;
+            } else if (selection->target == GIZMO_TARGET_LIGHT &&
+                       selection->index < renderer->scene.light_count) {
+                target = renderer->scene.lights[selection->index].position;
+            }
+            if (target) {
+                renderer->scene.camera_focus_distance =
+                    pt_vec3_distance(renderer->scene.camera_position, target);
+            }
+        }
     }
     nk_end(ctx);
 }

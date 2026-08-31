@@ -1,0 +1,77 @@
+# pathtracer scene v1
+#
+# The white furnace test. Run it with the sky off:
+#
+#   Pathtracer --scene scenes/furnace.pts --sky 0 --capture furnace.pfm --samples 512
+#
+# A huge sphere encloses everything and emits uniformly, so every direction carries the same
+# radiance. Inside it sit five probes with an albedo of exactly 1, differing only in roughness.
+# A surface that neither absorbs nor emits must return precisely the radiance arriving at it,
+# so each probe should vanish against the background -- and any probe that does not is a BSDF
+# that is losing or inventing energy.
+#
+# This is deliberately built out of an emissive *instance* rather than the sky, because an
+# emissive instance is found by BSDF rays alone. That is exactly the path being tested, and it
+# means the test needs no code and no special render mode.
+#
+# Expect the rough probes to come out slightly dark. Single-scattering GGX genuinely loses the
+# energy that would have taken a second bounce across the microsurface, and the deficit grows
+# with roughness; multiple-scattering compensation is what fixes it. The test is here to catch
+# gross errors in the weight, not that known deficit.
+
+camera
+  position 0 0 15
+  yaw 180
+  pitch 0
+  fov 40
+
+entity "enclosure"
+  shape       sphere
+  translation 0 0 0
+  rotation    0 0 0
+  scale       60 60 60
+  albedo      0 0 0
+  emission    1 1 1
+  emission_strength 1
+  roughness   1
+
+entity "probe rough 1.00"
+  shape       sphere
+  translation -5 0 0
+  rotation    0 0 0
+  scale       1 1 1
+  albedo      1 1 1
+  roughness   1
+
+entity "probe rough 0.75"
+  shape       sphere
+  translation -2.5 0 0
+  rotation    0 0 0
+  scale       1 1 1
+  albedo      1 1 1
+  roughness   0.75
+
+entity "probe rough 0.50"
+  shape       sphere
+  translation 0 0 0
+  rotation    0 0 0
+  scale       1 1 1
+  albedo      1 1 1
+  roughness   0.5
+
+entity "probe rough 0.25"
+  shape       sphere
+  translation 2.5 0 0
+  rotation    0 0 0
+  scale       1 1 1
+  albedo      1 1 1
+  roughness   0.25
+
+entity "probe mirror"
+  shape       sphere
+  translation 5 0 0
+  rotation    0 0 0
+  scale       1 1 1
+  albedo      1 1 1
+  roughness   0
+  metallic    1

@@ -1,7 +1,14 @@
 #include "renderer.h"
 
+#include "bluenoise.h"
 #include "gpu_internal.h"
+#include "spectral.h"
 
+#include <stb/stb_image_write.h>
+
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define PT_OUTPUT_FORMAT VK_FORMAT_R16G16B16A16_SFLOAT
@@ -13,8 +20,16 @@
 #define PT_DEPTH_FORMAT VK_FORMAT_R32_SFLOAT
 // One entity index per pixel. Integer, so it must never be filtered or interpolated.
 #define PT_PICK_FORMAT VK_FORMAT_R32_UINT
+// Half float is ample for a unit vector; the denoiser only ever takes a dot product of two.
+#define PT_NORMAL_FORMAT VK_FORMAT_R16G16B16A16_SFLOAT
 #define PT_SPIRV_PATH PT_SHADER_DIR "/pathtracer.spv"
 #define PT_SLANG_PATH PT_SHADER_SRC_DIR "/pathtracer.slang"
+// The denoiser's module. Compiled here as well as by the build, so a hot reload rebuilds
+// both shaders rather than leaving one of them stale.
+#define PT_ATROUS_SPIRV_PATH PT_SHADER_DIR "/atrous.spv"
+#define PT_ATROUS_SLANG_PATH PT_SHADER_SRC_DIR "/atrous.slang"
+#define PT_TONEMAP_SPIRV_PATH PT_SHADER_DIR "/tonemap.spv"
+#define PT_TONEMAP_SLANG_PATH PT_SHADER_SRC_DIR "/tonemap.slang"
 
 // Starting point for pt_settings_t::max_bounces; the overlay takes it from here.
 #define PT_DEFAULT_MAX_BOUNCES 5
@@ -26,13 +41,21 @@ static const char *const PT_MISS_ENTRIES[] = {"miss", "miss_shadow"};
 // One record per hit group, indexed by pt_hit_group_t: this order is what the instances'
 // instanceShaderBindingTableRecordOffset values select between. The three procedural groups
 // differ only in their intersection shader and share one closest hit shader.
+//
+// The any-hit shaders exist solely so a shadow ray can pass through glass; see the comment on
+// anyhit_shadow_mesh. They cost nothing on primary rays, which never invoke them because the
+// geometry is built opaque.
 static const gpu_hit_group_t PT_HIT_GROUPS[PT_HIT_GROUP_COUNT] = {
-    [PT_HIT_GROUP_MESH] = {.closest_hit = "closesthit_mesh"},
+    [PT_HIT_GROUP_MESH] = {.closest_hit = "closesthit_mesh",
+                           .any_hit = "anyhit_shadow_mesh"},
     [PT_HIT_GROUP_SPHERE] = {.closest_hit = "closesthit_procedural",
+                             .any_hit = "anyhit_shadow_procedural",
                              .intersection = "isect_sphere"},
     [PT_HIT_GROUP_CYLINDER] = {.closest_hit = "closesthit_procedural",
+                               .any_hit = "anyhit_shadow_procedural",
                                .intersection = "isect_cylinder"},
     [PT_HIT_GROUP_CONE] = {.closest_hit = "closesthit_procedural",
+                           .any_hit = "anyhit_shadow_procedural",
                            .intersection = "isect_cone"},
 };
 
@@ -82,6 +105,17 @@ static void write_descriptors(renderer_t *renderer)
         .imageView = renderer->pick.view,
         .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
     };
+    const VkDescriptorImageInfo normal_info = {
+        .imageView = renderer->normal.view,
+        .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+    };
+    // Not one of the render targets: a fixed table uploaded once, so unlike the five above it
+    // survives a resize untouched. It is rewritten here anyway because this function rewrites
+    // the whole set, which costs nothing and keeps the two lists in step.
+    const VkDescriptorImageInfo bluenoise_info = {
+        .imageView = pt_bluenoise_image()->view,
+        .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+    };
 
     const VkWriteDescriptorSet writes[] = {
         {
@@ -124,6 +158,22 @@ static void write_descriptors(renderer_t *renderer)
             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
             .pImageInfo = &pick_info,
         },
+        {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = renderer->set,
+            .dstBinding = 5,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .pImageInfo = &normal_info,
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = renderer->set,
+            .dstBinding = 6,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .pImageInfo = &bluenoise_info,
+        },
     };
     vkUpdateDescriptorSets(renderer->device->device, PT_COUNT(writes), writes, 0, NULL);
 }
@@ -165,6 +215,18 @@ static void create_descriptor_objects(renderer_t *renderer)
             .descriptorCount = 1,
             .stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR,
         },
+        {
+            .binding = 5,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR,
+        },
+        {
+            .binding = 6,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR,
+        },
     };
     const VkDescriptorSetLayoutCreateInfo layout_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
@@ -176,7 +238,7 @@ static void create_descriptor_objects(renderer_t *renderer)
 
     const VkDescriptorPoolSize pool_sizes[] = {
         {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
-        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4},
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 6},
     };
     const VkDescriptorPoolCreateInfo pool_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
@@ -212,6 +274,17 @@ static void create_targets(renderer_t *renderer, VkExtent2D extent)
     renderer->pick = gpu_image_create(renderer->device, extent, PT_PICK_FORMAT,
                                       VK_IMAGE_USAGE_STORAGE_BIT |
                                           VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    // Storage only: raygen writes it and the denoiser's compute pass reads it, and neither
+    // of those needs it sampled.
+    renderer->normal = gpu_image_create(renderer->device, extent, PT_NORMAL_FORMAT,
+                                        VK_IMAGE_USAGE_STORAGE_BIT);
+    // Both post-process passes size their own images from the render target's.
+    denoise_resize(&renderer->denoise, extent);
+    tonemap_resize(&renderer->tonemap, extent);
+    // Nothing has been blitted at this size yet, and the old pointers may name destroyed
+    // images. renderer_record replaces both before anything reads them.
+    renderer->display = &renderer->output;
+    renderer->display_linear = &renderer->output;
     // A fresh accumulator holds nothing worth keeping.
     renderer->accum_frames = 0;
 }
@@ -229,10 +302,32 @@ void renderer_init(renderer_t *renderer, gpu_device_t *device)
         .samples_per_frame = 1,
         .unlit = 0,
         .sky_intensity = 1.0f,
+        .turbidity = 3.0f,
+        .sun_azimuth = 200.0f,
+        // Roughly where the old hardcoded sun lobe sat, so the default framing of the shipped
+        // scenes is not thrown away by the switch to an authored sun.
+        .sun_elevation = 44.0f,
+        // The real sun. Affordable now only because sun_lighting samples the disc explicitly;
+        // before that it had to be a 14 degree lobe to be found at all.
+        .sun_angular_diameter = 0.53f,
     };
 
     gpu_uploader_init(&renderer->uploader, device);
+
+    // Before the scene, because an entity's colour means nothing without the tables that turn
+    // it into a spectrum. A failure here is reported and survivable -- pt_spectral_init leaves
+    // an achromatic table behind rather than a null address -- so it is deliberately not fatal.
+    pt_spectral_init(device, &renderer->uploader, PT_ASSET_DIR "/bin");
+
+    // Before create_descriptor_objects, whose set names the atlas by image view. Survivable
+    // in the same way the spectral tables are: it falls back to white noise and says so.
+    pt_bluenoise_init(device, &renderer->uploader, PT_ASSET_DIR);
+
     create_descriptor_objects(renderer);
+
+    // Before create_targets, which asks both to size their images.
+    denoise_init(&renderer->denoise, device);
+    tonemap_init(&renderer->tonemap, device);
 
     // The built-in showcase, which main.c then replaces with a scene file when one loads.
     // Starting from it means a missing or broken file leaves something on screen.
@@ -257,6 +352,9 @@ void renderer_free(renderer_t *renderer)
     gpu_device_t *gpu = renderer->device;
 
     gpu_rt_pipeline_destroy(gpu, &renderer->pipeline);
+    tonemap_free(&renderer->tonemap);
+    denoise_free(&renderer->denoise);
+    gpu_image_destroy(gpu, &renderer->normal);
     gpu_image_destroy(gpu, &renderer->pick);
     gpu_image_destroy(gpu, &renderer->depth);
     gpu_image_destroy(gpu, &renderer->accum);
@@ -266,6 +364,8 @@ void renderer_free(renderer_t *renderer)
     vkDestroyDescriptorSetLayout(gpu->device, renderer->set_layout, NULL);
 
     pt_scene_free(&renderer->scene, gpu);
+    pt_bluenoise_free(gpu);
+    pt_spectral_free(gpu);
 
     gpu_uploader_free(&renderer->uploader);
     memset(renderer, 0, sizeof(*renderer));
@@ -281,6 +381,7 @@ void renderer_resize(renderer_t *renderer, VkExtent2D extent)
     // The old images may still be referenced by frames in flight.
     VK_CHECK(vkDeviceWaitIdle(renderer->device->device));
 
+    gpu_image_destroy(renderer->device, &renderer->normal);
     gpu_image_destroy(renderer->device, &renderer->pick);
     gpu_image_destroy(renderer->device, &renderer->depth);
     gpu_image_destroy(renderer->device, &renderer->accum);
@@ -335,6 +436,204 @@ uint32_t renderer_pick(renderer_t *renderer, uint32_t x, uint32_t y)
     return value == 0 ? UINT32_MAX : value - 1;
 }
 
+// PT_OUTPUT_FORMAT is a half float format, and there is no half type in C11. Decoding by hand
+// is a dozen lines and keeps the readback free of any dependency on compiler extensions.
+static float half_to_float(uint16_t half)
+{
+    const uint32_t sign = (uint32_t)(half >> 15) << 31;
+    const uint32_t exponent = (half >> 10) & 0x1Fu;
+    const uint32_t mantissa = half & 0x3FFu;
+
+    uint32_t bits;
+    if (exponent == 0u) {
+        if (mantissa == 0u) {
+            bits = sign; // +-0
+        } else {
+            // Subnormal as a half, but normal as a float: shift the mantissa up until its
+            // leading bit falls off the top, and pay for each shift with the exponent.
+            uint32_t shifted = mantissa;
+            uint32_t shift = 0u;
+            while ((shifted & 0x400u) == 0u) {
+                shifted <<= 1;
+                ++shift;
+            }
+            bits = sign | ((127u - 15u - shift + 1u) << 23) | ((shifted & 0x3FFu) << 13);
+        }
+    } else if (exponent == 31u) {
+        bits = sign | 0x7F800000u | (mantissa << 13); // infinity or NaN
+    } else {
+        // The only difference is the exponent bias: 15 for half, 127 for float.
+        bits = sign | ((exponent + 127u - 15u) << 23) | (mantissa << 13);
+    }
+
+    float value;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+// The encode the sRGB swapchain format performs in hardware on the blit. Done by hand here
+// because a PNG has to carry display-referred values, and this image is linear.
+static uint8_t encode_srgb(float linear)
+{
+    // NaN fails every comparison, so testing for the *inside* of the range and defaulting to
+    // zero keeps a stray NaN from reaching the cast below as garbage.
+    float value = 0.0f;
+    if (linear > 0.0f) {
+        value = linear < 1.0f ? linear : 1.0f;
+    }
+
+    const float encoded =
+        value <= 0.0031308f ? value * 12.92f : 1.055f * powf(value, 1.0f / 2.4f) - 0.055f;
+    return (uint8_t)(encoded * 255.0f + 0.5f);
+}
+
+bool renderer_screenshot(renderer_t *renderer, const char *path)
+{
+    // Whatever the last frame put on screen, denoised or not. Its format matches the output
+    // image's either way, so the half float decode below is the same for both.
+    const gpu_image_t *displayed = renderer->display;
+    const VkExtent2D extent = displayed->extent;
+    if (extent.width == 0u || extent.height == 0u) {
+        fprintf(stderr, "screenshot: nothing has been rendered yet\n");
+        return false;
+    }
+
+    const VkDeviceSize pixels = (VkDeviceSize)extent.width * extent.height;
+    const VkDeviceSize size = pixels * 8u; // RGBA, 16 bits a channel
+
+    // Same reasoning as renderer_pick: the image holds what the last completed frame wrote,
+    // and a stall is the only way to say so from outside a recording frame. This runs on a
+    // keypress, so the cost is invisible.
+    VK_CHECK(vkDeviceWaitIdle(renderer->device->device));
+
+    gpu_buffer_t staging = gpu_buffer_create(renderer->device, size,
+                                             VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                             GPU_MEMORY_READBACK);
+
+    VkCommandBuffer cmd = gpu_upload_begin(&renderer->uploader);
+    const VkBufferImageCopy2 region = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2,
+        .imageSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
+        .imageExtent = {extent.width, extent.height, 1},
+    };
+    const VkCopyImageToBufferInfo2 copy = {
+        .sType = VK_STRUCTURE_TYPE_COPY_IMAGE_TO_BUFFER_INFO_2,
+        .srcImage = displayed->handle,
+        // The render target never leaves GENERAL -- see the barriers in renderer_record.
+        .srcImageLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .dstBuffer = staging.handle,
+        .regionCount = 1,
+        .pRegions = &region,
+    };
+    vkCmdCopyImageToBuffer2(cmd, &copy);
+    gpu_upload_end(&renderer->uploader); // submits and waits
+
+    // Three bytes a pixel: the alpha channel raygen writes is a constant 1 and carries
+    // nothing worth storing.
+    uint8_t *rgb = gpu_alloc((size_t)pixels * 3u);
+
+    const uint16_t *source = staging.mapped;
+    for (VkDeviceSize i = 0; i < pixels; ++i) {
+        for (uint32_t channel = 0; channel < 3u; ++channel) {
+            rgb[i * 3u + channel] = encode_srgb(half_to_float(source[i * 4u + channel]));
+        }
+    }
+
+    const int written = stbi_write_png(path, (int)extent.width, (int)extent.height, 3, rgb,
+                                       (int)extent.width * 3);
+    free(rgb);
+    gpu_buffer_destroy(renderer->device, &staging);
+
+    if (!written) {
+        fprintf(stderr, "screenshot: could not write '%s'\n", path);
+        return false;
+    }
+
+    printf("screenshot: wrote %s (%ux%u, %u samples)\n", path, extent.width, extent.height,
+           renderer->accum_frames * renderer->settings.samples_per_frame);
+    return true;
+}
+
+// The same readback as above, but written as a PFM: linear, full float, no sRGB encode and no
+// quantisation. Comparing two builds means measuring differences of a few percent against
+// Monte Carlo noise, and eight bits through a gamma curve cannot resolve that -- so the eye
+// gets the PNG and the diff script gets this.
+bool renderer_capture_pfm(renderer_t *renderer, const char *path)
+{
+    // Stops before the tonemapper, unlike the screenshot: a PFM has to stay scene-referred
+    // to be worth diffing. See the comment on renderer_capture_pfm.
+    const gpu_image_t *displayed = renderer->display_linear;
+    const VkExtent2D extent = displayed->extent;
+    if (extent.width == 0u || extent.height == 0u) {
+        fprintf(stderr, "capture: nothing has been rendered yet\n");
+        return false;
+    }
+
+    const VkDeviceSize pixels = (VkDeviceSize)extent.width * extent.height;
+
+    VK_CHECK(vkDeviceWaitIdle(renderer->device->device));
+
+    gpu_buffer_t staging = gpu_buffer_create(renderer->device, pixels * 8u,
+                                             VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                             GPU_MEMORY_READBACK);
+
+    VkCommandBuffer cmd = gpu_upload_begin(&renderer->uploader);
+    const VkBufferImageCopy2 region = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2,
+        .imageSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
+        .imageExtent = {extent.width, extent.height, 1},
+    };
+    const VkCopyImageToBufferInfo2 copy = {
+        .sType = VK_STRUCTURE_TYPE_COPY_IMAGE_TO_BUFFER_INFO_2,
+        .srcImage = displayed->handle,
+        .srcImageLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .dstBuffer = staging.handle,
+        .regionCount = 1,
+        .pRegions = &region,
+    };
+    vkCmdCopyImageToBuffer2(cmd, &copy);
+    gpu_upload_end(&renderer->uploader);
+
+    FILE *file = fopen(path, "wb");
+    if (!file) {
+        fprintf(stderr, "capture: could not open '%s'\n", path);
+        gpu_buffer_destroy(renderer->device, &staging);
+        return false;
+    }
+
+    // A negative scale is PFM's way of saying the samples are little endian.
+    fprintf(file, "PF\n%u %u\n-1.0\n", extent.width, extent.height);
+
+    const uint16_t *source = staging.mapped;
+    float *row = gpu_alloc((size_t)extent.width * 3u * sizeof(float));
+    bool ok = true;
+
+    // PFM rows run bottom to top, which is the opposite of the image's own order.
+    for (uint32_t y = 0; y < extent.height && ok; ++y) {
+        const uint16_t *line = source + (VkDeviceSize)(extent.height - 1u - y) * extent.width * 4u;
+        for (uint32_t x = 0; x < extent.width; ++x) {
+            for (uint32_t channel = 0; channel < 3u; ++channel) {
+                row[x * 3u + channel] = half_to_float(line[x * 4u + channel]);
+            }
+        }
+        ok = fwrite(row, sizeof(float), (size_t)extent.width * 3u, file) ==
+             (size_t)extent.width * 3u;
+    }
+
+    free(row);
+    ok = fclose(file) == 0 && ok;
+    gpu_buffer_destroy(renderer->device, &staging);
+
+    if (!ok) {
+        fprintf(stderr, "capture: could not write '%s'\n", path);
+        return false;
+    }
+
+    printf("screenshot: wrote %s (%ux%u, %u samples)\n", path, extent.width, extent.height,
+           renderer->accum_frames * renderer->settings.samples_per_frame);
+    return true;
+}
+
 void renderer_sync_scene(renderer_t *renderer)
 {
     if (pt_scene_sync(&renderer->scene, renderer->device, &renderer->uploader)) {
@@ -344,20 +643,34 @@ void renderer_sync_scene(renderer_t *renderer)
     }
 }
 
-bool renderer_reload_shaders(renderer_t *renderer)
+// One .slang module to one .spv. Mirrors the build rule in xmake.lua, including -O0 (this
+// slang build cannot load its own spirv-opt) with the system optimiser applied afterwards
+// when present.
+static bool compile_slang(const char *source, const char *spirv)
 {
     char command[1024];
-    // Mirrors the build rule in xmake.lua, including -O0 (this slang build cannot load
-    // its own spirv-opt) with the system optimiser applied afterwards when present.
     snprintf(command, sizeof(command),
              "\"%s\" \"%s\" -target spirv -profile spirv_1_5 -emit-spirv-directly "
              "-fvk-use-entrypoint-name -fvk-use-scalar-layout -O0 -o \"%s\" && "
              "{ command -v spirv-opt >/dev/null && "
              "spirv-opt --scalar-block-layout -O \"%s\" -o \"%s\" || true; }",
-             PT_SLANGC, PT_SLANG_PATH, PT_SPIRV_PATH, PT_SPIRV_PATH, PT_SPIRV_PATH);
+             PT_SLANGC, source, spirv, spirv, spirv);
 
     if (system(command) != 0) {
-        fprintf(stderr, "reload: slangc failed, keeping the running pipeline\n");
+        fprintf(stderr, "reload: slangc failed on %s\n", source);
+        return false;
+    }
+    return true;
+}
+
+bool renderer_reload_shaders(renderer_t *renderer)
+{
+    // Both modules are compiled before either pipeline is touched, so a broken denoise
+    // shader cannot leave the tracer half reloaded.
+    if (!compile_slang(PT_SLANG_PATH, PT_SPIRV_PATH) ||
+        !compile_slang(PT_ATROUS_SLANG_PATH, PT_ATROUS_SPIRV_PATH) ||
+        !compile_slang(PT_TONEMAP_SLANG_PATH, PT_TONEMAP_SPIRV_PATH)) {
+        fprintf(stderr, "reload: keeping the running pipelines\n");
         return false;
     }
 
@@ -372,6 +685,15 @@ bool renderer_reload_shaders(renderer_t *renderer)
     VK_CHECK(vkDeviceWaitIdle(renderer->device->device));
     gpu_rt_pipeline_destroy(renderer->device, &renderer->pipeline);
     renderer->pipeline = rebuilt;
+
+    // The denoiser is a post-process, so a failure here leaves a perfectly good image on
+    // screen; report it and carry on rather than failing the whole reload.
+    if (!denoise_reload_shaders(&renderer->denoise)) {
+        fprintf(stderr, "reload: the tracer reloaded but the denoiser did not\n");
+    }
+    if (!tonemap_reload_shaders(&renderer->tonemap)) {
+        fprintf(stderr, "reload: the tracer reloaded but the tonemapper did not\n");
+    }
 
     // Whatever has accumulated so far came out of the old shaders.
     renderer_reset_accumulation(renderer);
@@ -412,7 +734,10 @@ void renderer_record(renderer_t *renderer, gpu_frame_t *frame, const pt_camera_t
         .image = renderer->output.handle,
         .old_layout = VK_IMAGE_LAYOUT_UNDEFINED,
         .new_layout = VK_IMAGE_LAYOUT_GENERAL,
+        // COMPUTE as well, because with the denoiser on the previous frame read this image
+        // from its first iteration rather than blitting it.
         .src_stage = VK_PIPELINE_STAGE_2_BLIT_BIT |
+                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
                      VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
         .src_access = VK_ACCESS_2_NONE,
         .dst_stage = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
@@ -435,10 +760,12 @@ void renderer_record(renderer_t *renderer, gpu_frame_t *frame, const pt_camera_t
                       VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
     });
 
-    // Both are fully overwritten every frame like `output`. They are consumed off the frame
-    // path -- depth by the debug pass's fragment shader, pick by a host readback -- so the
-    // source scope names those rather than the blit.
-    const VkImage per_pixel_outputs[] = {renderer->depth.handle, renderer->pick.handle};
+    // All three are fully overwritten every frame like `output`. They are consumed off the
+    // frame path -- depth by the debug pass's fragment shader and by the denoiser, pick by a
+    // host readback, normal by the denoiser -- so the source scope names those rather than
+    // the blit.
+    const VkImage per_pixel_outputs[] = {renderer->depth.handle, renderer->pick.handle,
+                                         renderer->normal.handle};
     for (uint32_t i = 0; i < PT_COUNT(per_pixel_outputs); ++i) {
         gpu_cmd_image_barrier(cmd, &(gpu_image_barrier_t){
             .image = per_pixel_outputs[i],
@@ -446,6 +773,7 @@ void renderer_record(renderer_t *renderer, gpu_frame_t *frame, const pt_camera_t
             .new_layout = VK_IMAGE_LAYOUT_GENERAL,
             .src_stage = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
                          VK_PIPELINE_STAGE_2_COPY_BIT |
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
                          VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
             .src_access = VK_ACCESS_2_NONE,
             .dst_stage = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
@@ -461,8 +789,8 @@ void renderer_record(renderer_t *renderer, gpu_frame_t *frame, const pt_camera_t
     const pt_push_constants_t push = {
         .instances = renderer->scene.instance_data.address,
         .lights = renderer->scene.light_data.address,
+        .spectra = pt_spectral_address(),
         .camera = *camera,
-        .aspect = (float)extent.width / (float)extent.height,
         .frame_index = renderer->accum_frames,
         .light_count = renderer->scene.light_count,
         .settings = renderer->settings,
@@ -475,16 +803,42 @@ void renderer_record(renderer_t *renderer, gpu_frame_t *frame, const pt_camera_t
     vkCmdTraceRaysKHR(cmd, &sbt->raygen, &sbt->miss, &sbt->hit, &sbt->callable, extent.width,
                       extent.height, 1);
 
-    // Ray tracing writes -> blit reads.
-    gpu_cmd_image_barrier(cmd, &(gpu_image_barrier_t){
-        .image = renderer->output.handle,
-        .old_layout = VK_IMAGE_LAYOUT_GENERAL,
-        .new_layout = VK_IMAGE_LAYOUT_GENERAL,
-        .src_stage = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
-        .src_access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-        .dst_stage = VK_PIPELINE_STAGE_2_BLIT_BIT,
-        .dst_access = VK_ACCESS_2_TRANSFER_READ_BIT,
-    });
+    const bool denoising = renderer->denoise.settings.enabled;
+    // Whether *anything* consumes the traced image in a compute shader before the blit. Both
+    // post-process passes are optional and either one can be first, so this asks about the
+    // chain as a whole rather than about the denoiser alone.
+    const bool post_processing = denoising || renderer->tonemap.settings.enabled;
+
+    // Ray tracing writes -> whoever reads the image next. That is a compute pass when one is
+    // switched on, and the blit below when neither is. The two G-buffers only matter to the
+    // denoiser, so they are only barriered when it will actually read them.
+    const VkImage traced[] = {renderer->output.handle, renderer->normal.handle,
+                              renderer->depth.handle};
+    const uint32_t traced_count = denoising ? PT_COUNT(traced) : 1u;
+    for (uint32_t i = 0; i < traced_count; ++i) {
+        gpu_cmd_image_barrier(cmd, &(gpu_image_barrier_t){
+            .image = traced[i],
+            .old_layout = VK_IMAGE_LAYOUT_GENERAL,
+            .new_layout = VK_IMAGE_LAYOUT_GENERAL,
+            .src_stage = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+            .src_access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            .dst_stage = post_processing ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT
+                                         : VK_PIPELINE_STAGE_2_BLIT_BIT,
+            .dst_access = post_processing ? VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+                                          : VK_ACCESS_2_TRANSFER_READ_BIT,
+        });
+    }
+
+    // The post-process chain. Each pass returns its input untouched when switched off, so
+    // every combination of the two toggles falls out without a special case -- and the blit
+    // below simply takes whatever the last one returned.
+    //
+    // Recorded here rather than after the blit because the blit is what puts it on screen.
+    renderer->display = denoise_record(&renderer->denoise, cmd, &renderer->output,
+                                       &renderer->normal, &renderer->depth);
+    // Captured before the tonemapper: a PFM has to stay scene-referred.
+    renderer->display_linear = renderer->display;
+    renderer->display = tonemap_record(&renderer->tonemap, cmd, renderer->display);
 
     // The swapchain image arrives in GENERAL from gpu_frame_begin, and is sRGB, so the
     // blit converts this linear float image into sRGB for free.
@@ -498,7 +852,7 @@ void renderer_record(renderer_t *renderer, gpu_frame_t *frame, const pt_camera_t
     };
     const VkBlitImageInfo2 blit = {
         .sType = VK_STRUCTURE_TYPE_BLIT_IMAGE_INFO_2,
-        .srcImage = renderer->output.handle,
+        .srcImage = renderer->display->handle,
         .srcImageLayout = VK_IMAGE_LAYOUT_GENERAL,
         .dstImage = frame->image,
         .dstImageLayout = VK_IMAGE_LAYOUT_GENERAL,

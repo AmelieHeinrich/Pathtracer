@@ -15,10 +15,12 @@ target("Pathtracer")
         add_defines("PT_ENABLE_VALIDATION")
     end
 
-    -- nuklear.h's single-header implementation does not compile clean under -Wall, so it
-    -- gets a translation unit of its own with warnings off rather than polluting the build.
-    add_files("src/*.c|nuklear_impl.c")
+    -- nuklear.h and stb_image_write.h's single-header implementations do not compile clean
+    -- under -Wall, so each gets a translation unit of its own with warnings off rather than
+    -- polluting the build.
+    add_files("src/*.c|nuklear_impl.c|stb_impl.c")
     add_files("src/nuklear_impl.c", {cflags = "-w"})
+    add_files("src/stb_impl.c", {cflags = "-w"})
     -- slang is used only as a build-time and hot-reload *tool* (slangc is spawned as a
     -- process), so it is deliberately linked with no libraries: linking libslang.so would
     -- add a runtime dependency on its plugin .so files for no benefit.
@@ -42,6 +44,47 @@ target("Pathtracer")
         -- Scenes are authored in place and saved back over the source tree, so this points at
         -- the repository rather than at anything under the build directory.
         target:add("defines", 'PT_SCENE_DIR="' .. path.absolute("scenes") .. '"')
+        -- Baked models are read from assets/bin, which the rule below fills from assets/source.
+        target:add("defines", 'PT_ASSET_DIR="' .. path.absolute("assets") .. '"')
+    end)
+
+    -- Models are baked out of process, by tools/bake_assets.py, into a format the renderer can
+    -- fread straight into a buffer -- which is why there is no OBJ or glTF parser anywhere in
+    -- src/. The script does its own mtime check per model, so this is a no-op once warm.
+    before_build(function (target)
+        import("lib.detect.find_program")
+        if not os.isdir("assets/source") then
+            return
+        end
+
+        local python = find_program("python3") or find_program("python")
+        if not python then
+            cprint("${color.warning}skipping asset bake: no python interpreter found")
+            return
+        end
+
+        -- execv rather than runv so the baker's own progress reaches the terminal: the first
+        -- bake of a large model is the one time this step is not instant.
+        if os.execv(python, {"tools/bake_assets.py"}) ~= 0 then
+            raise("asset bake failed")
+        end
+    end)
+
+    -- The spectral tables are baked the same way and into the same place, but out of their own
+    -- script rather than out of a source asset: the Jakob-Hanika fit is a computation, not a
+    -- conversion, so its only input is the tool itself. It checks its own mtime against the
+    -- blob and is a silent no-op once warm; a cold bake is several minutes.
+    before_build(function (target)
+        import("lib.detect.find_program")
+        local python = find_program("python3") or find_program("python")
+        if not python then
+            cprint("${color.warning}skipping spectral bake: no python interpreter found")
+            return
+        end
+
+        if os.execv(python, {"tools/bake_spectral.py"}) ~= 0 then
+            raise("spectral bake failed")
+        end
     end)
 
     -- One .slang module compiles to one .spv holding every entry point.

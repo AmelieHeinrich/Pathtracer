@@ -38,7 +38,8 @@ static bool key_held(GLFWwindow *window, int key)
 }
 
 pt_camera_t pt_fly_camera_update(pt_fly_camera_t *camera, GLFWwindow *window, float dt,
-                                 float fov_degrees, float scroll, bool blocked)
+                                 float fov_degrees, float aperture, float focus_distance,
+                                 float scroll, bool blocked)
 {
     double cursor_x = 0.0;
     double cursor_y = 0.0;
@@ -127,5 +128,6 @@ pt_camera_t pt_fly_camera_update(pt_fly_camera_t *camera, GLFWwindow *window, fl
 
     float target[3];
     pt_vec3_add(target, camera->position, forward);
-    return pt_camera_look_at(camera->position, target, fov_degrees);
+    return pt_camera_look_at(camera->position, target, fov_degrees, aperture,
+                             focus_distance);
 }

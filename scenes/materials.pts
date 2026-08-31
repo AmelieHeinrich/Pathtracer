@@ -1,0 +1,87 @@
+# pathtracer scene v1
+#
+# What the three material features do, side by side. Left to right:
+#
+#   gold        a conductor -- metallic 1, so there is no diffuse base and the albedo tints
+#               the reflection instead of colouring a surface underneath it
+#   copper      the same, rougher, to show a metal's highlight spread rather than a mirror
+#   glass       a smooth dielectric: refraction, total internal reflection, and a caustic
+#   gem         the same but dispersive, so the four wavelengths of a path separate and the
+#               caustic breaks into colour. Abbe 20 is dense flint, about as dispersive as
+#               ordinary glass gets
+#   absorb      coloured glass. The tint is not a surface colour: it is Beer-Lambert
+#               absorption, so it deepens with the thickness of glass the light crossed
+#
+# The metal albedos are the usual linear-sRGB reflectances for the two metals.
+
+camera
+  position 0 2.4 9.5
+  yaw 180
+  pitch -9
+  fov 42
+
+entity "ground"
+  shape       plane
+  translation 0 0 0
+  rotation    0 0 0
+  scale       14 1 14
+  albedo      0.58 0.58 0.6
+  roughness   0.9
+
+entity "gold"
+  shape       sphere
+  translation -4.2 1 0
+  rotation    0 0 0
+  scale       1 1 1
+  albedo      1 0.766 0.336
+  roughness   0.08
+  metallic    1
+
+entity "copper"
+  shape       sphere
+  translation -2.1 1 0
+  rotation    0 0 0
+  scale       1 1 1
+  albedo      0.955 0.638 0.538
+  roughness   0.32
+  metallic    1
+
+entity "glass"
+  shape        sphere
+  translation  0 1 0
+  rotation     0 0 0
+  scale        1 1 1
+  albedo       1 1 1
+  roughness    0
+  transmission 1
+  ior          1.5
+
+entity "gem"
+  shape        sphere
+  translation  2.1 1 0
+  rotation     0 0 0
+  scale        1 1 1
+  albedo       1 1 1
+  roughness    0
+  transmission 1
+  ior          1.72
+  abbe         20
+
+entity "absorb"
+  shape        sphere
+  translation  4.2 1 0
+  rotation     0 0 0
+  scale        1 1 1
+  albedo       1 1 1
+  roughness    0
+  transmission 1
+  ior          1.5
+  absorption   0.16 0.62 0.34
+  absorption_distance 1
+
+light "key"
+  type      point
+  position  -1.5 6.5 4
+  color     1 1 1
+  intensity 160
+  temperature 5200

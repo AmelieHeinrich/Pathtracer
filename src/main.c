@@ -10,9 +10,14 @@
 
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <strings.h> // strcasecmp, so --tonemap accepts the names the overlay shows
 
 static bool g_reload_requested = false;
+// Like the reload and the pick below: set from the callback, serviced at the top of the loop,
+// because renderer_screenshot stalls the device and must not run inside a recording frame.
+static bool g_screenshot_requested = false;
 // Accumulated by the callback and drained once a frame, so a fast wheel never loses notches.
 static float g_scroll = 0.0f;
 // Set by the number keys; the UI has radio buttons for the same thing. 1/2/3 rather than the
@@ -34,6 +39,9 @@ static void on_key(GLFWwindow *window, int key, int scancode, int action, int mo
     case GLFW_KEY_R:
         g_reload_requested = true;
         break;
+    case GLFW_KEY_F12:
+        g_screenshot_requested = true;
+        break;
     case GLFW_KEY_1:
         g_requested_mode = GIZMO_MODE_TRANSLATE;
         break;
@@ -48,6 +56,117 @@ static void on_key(GLFWwindow *window, int key, int scancode, int action, int mo
     }
 }
 
+typedef struct pt_options_t {
+    const char *scene;   // NULL: the default scene file
+    const char *capture; // non-NULL: render `samples` samples into it, then exit
+    uint32_t samples;
+    // Negative leaves renderer_init's default alone. Overridable because sky_intensity is a
+    // render setting rather than scene data, and cornell.pts is only itself with the sky at
+    // 0 -- which also makes it the one scene a change to the sky cannot perturb.
+    float sky;
+    // Renders the material with no light transport at all. Worth a flag because it is the
+    // renderer's own check on the spectral upsampling: an albedo turned into a spectrum and
+    // resolved back must give the colour that was authored, and this is the view that shows
+    // exactly that and nothing else.
+    bool unlit;
+    // Switches the a-trous filter on. The overlay is the usual way to reach it, but a
+    // --capture runs headless to a file and never sees the overlay, so comparing a filtered
+    // render against a raw one needs a flag.
+    bool denoise;
+    // Tonemapping is on by default, so unlike --denoise these exist to turn it *off* or pin
+    // it: a --capture PNG is only comparable against another one shaped the same way. The
+    // PFM path is unaffected either way -- it stops before the tonemapper by design.
+    const char *tonemap; // NULL leaves the default curve
+    float exposure;      // stops
+    // Both negative to mean "leave the default alone", for the same reason --sky exists: the
+    // sky is a render setting, so a capture that depends on it has to be able to pin it.
+    float turbidity;
+    float sun_elevation;
+    // 0 leaves the default. Worth pinning because a transmissive object spends two bounces
+    // per traversal, so a glass test is only comparable against a budget it cannot exhaust.
+    uint32_t bounces;
+    // Load, write straight back out, and exit. The only way to check from outside the UI that
+    // every authored field survives a save -- which matters because the writer is what stands
+    // between someone tuning a material in the panel and still having it tomorrow.
+    const char *resave;
+} pt_options_t;
+
+// A deliberately tiny command line. Its whole reason for existing is --capture: comparing two
+// builds means rendering the same scene from the same viewpoint to the *same sample count*
+// and diffing the files, which is not something a human with a screenshot key can do
+// repeatably.
+//
+// An unrecognised argument is an error rather than a warning, because the failure it guards
+// against -- a comparison script quietly capturing under the wrong settings, and the diff
+// being read as a real change -- is much worse than an early exit.
+static bool parse_options(int argc, char **argv, pt_options_t *out)
+{
+    *out = (pt_options_t){
+        .samples = 512u, .sky = -1.0f, .turbidity = -1.0f, .sun_elevation = -1000.0f};
+
+    for (int i = 1; i < argc; ++i) {
+        const bool has_value = i + 1 < argc;
+        if (strcmp(argv[i], "--scene") == 0 && has_value) {
+            out->scene = argv[++i];
+        } else if (strcmp(argv[i], "--capture") == 0 && has_value) {
+            out->capture = argv[++i];
+        } else if (strcmp(argv[i], "--samples") == 0 && has_value) {
+            out->samples = (uint32_t)strtoul(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--sky") == 0 && has_value) {
+            out->sky = strtof(argv[++i], NULL);
+        } else if (strcmp(argv[i], "--turbidity") == 0 && has_value) {
+            out->turbidity = strtof(argv[++i], NULL);
+        } else if (strcmp(argv[i], "--sun-elevation") == 0 && has_value) {
+            out->sun_elevation = strtof(argv[++i], NULL);
+        } else if (strcmp(argv[i], "--bounces") == 0 && has_value) {
+            out->bounces = (uint32_t)strtoul(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--resave") == 0 && has_value) {
+            out->resave = argv[++i];
+        } else if (strcmp(argv[i], "--unlit") == 0) {
+            out->unlit = true;
+        } else if (strcmp(argv[i], "--denoise") == 0) {
+            out->denoise = true;
+        } else if (strcmp(argv[i], "--tonemap") == 0 && has_value) {
+            out->tonemap = argv[++i];
+        } else if (strcmp(argv[i], "--exposure") == 0 && has_value) {
+            out->exposure = strtof(argv[++i], NULL);
+        } else {
+            fprintf(stderr,
+                    "usage: %s [--scene FILE] [--sky N] [--unlit] [--denoise]"
+                    " [--tonemap none|agx|aces|reinhard] [--exposure STOPS]"
+                    " [--turbidity N] [--sun-elevation DEG]"
+                    " [--capture OUT.png|OUT.pfm [--samples N]]\n",
+                    argv[0]);
+            return false;
+        }
+    }
+
+    // Zero would never satisfy the loop's exit test, leaving the window up forever with no
+    // hint as to why.
+    if (out->samples == 0u) {
+        out->samples = 1u;
+    }
+    return true;
+}
+
+// Picks the first unused screenshot_NNNN.png in the working directory, which xmake's
+// set_rundir pins to the repository root. It scans rather than counting from zero so a
+// restart cannot overwrite what an earlier session captured.
+static bool next_screenshot_path(char *out, size_t size)
+{
+    for (uint32_t i = 0; i < 10000u; ++i) {
+        snprintf(out, size, "screenshot_%04u.png", i);
+        FILE *existing = fopen(out, "rb");
+        if (!existing) {
+            return true;
+        }
+        fclose(existing);
+    }
+
+    fprintf(stderr, "screenshot: every name from screenshot_0000.png upwards is taken\n");
+    return false;
+}
+
 // Installed before ui_init, which chains onto it: the wheel drives either the UI or the
 // camera's move speed, and the loop below picks which by asking ui_captures_mouse.
 static void on_scroll(GLFWwindow *window, double x, double y)
@@ -57,8 +176,13 @@ static void on_scroll(GLFWwindow *window, double x, double y)
     g_scroll += (float)y;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    pt_options_t options;
+    if (!parse_options(argc, argv, &options)) {
+        return 1;
+    }
+
     // volk owns the loader, so GLFW has to be handed vkGetInstanceProcAddr rather than
     // dlopen'ing libvulkan itself. Both must happen before glfwInit().
     if (volkInitialize() != VK_SUCCESS) {
@@ -104,7 +228,49 @@ int main(void)
     ui_init(&ui, &device, window, swapchain.format);
 
     // Falls back to the built-in showcase renderer_init already put in place.
-    pt_scene_load(&renderer.scene, PT_SCENE_DIR "/default.pts");
+    pt_scene_load(&renderer.scene, options.scene ? options.scene : PT_SCENE_DIR "/models.pts");
+
+    if (options.sky >= 0.0f) {
+        renderer.settings.sky_intensity = options.sky;
+    }
+    if (options.unlit) {
+        renderer.settings.unlit = 1u;
+    }
+    // Not members of renderer.settings, deliberately: both run over the averaged image and
+    // must never restart the accumulation.
+    renderer.denoise.settings.enabled = options.denoise;
+    renderer.tonemap.settings.exposure = options.exposure;
+    if (options.tonemap) {
+        bool matched = false;
+        for (uint32_t i = 0; i < (uint32_t)TONEMAP_CURVE_COUNT; ++i) {
+            if (strcasecmp(options.tonemap, TONEMAP_CURVE_NAMES[i]) == 0) {
+                renderer.tonemap.settings.curve = (tonemap_curve_t)i;
+                matched = true;
+                break;
+            }
+        }
+        // An unrecognised curve is an error for the same reason an unrecognised argument is:
+        // a capture script quietly shaping its output the wrong way is worse than an exit.
+        if (!matched) {
+            fprintf(stderr, "unknown tonemap curve '%s'\n", options.tonemap);
+            return 1;
+        }
+    }
+    if (options.resave) {
+        const bool saved = pt_scene_save(&renderer.scene, options.resave);
+        // Everything below needs a window and a device that are already up, so tearing down
+        // properly would mean threading an early exit through all of it for a debug path.
+        return saved ? 0 : 1;
+    }
+    if (options.bounces > 0u) {
+        renderer.settings.max_bounces = options.bounces;
+    }
+    if (options.turbidity >= 0.0f) {
+        renderer.settings.turbidity = options.turbidity;
+    }
+    if (options.sun_elevation > -999.0f) {
+        renderer.settings.sun_elevation = options.sun_elevation;
+    }
 
     pt_fly_camera_t fly;
     pt_fly_camera_init(&fly, renderer.scene.camera_position, renderer.scene.camera_yaw,
@@ -115,11 +281,15 @@ int main(void)
     gizmo_selection_t selection = {0};
 
     printf("WASD/QE to fly, right mouse to look, wheel for speed.\n"
-           "1/2/3 switch the gizmo between move, rotate and scale. R reloads the shaders.\n");
+           "1/2/3 switch the gizmo between move, rotate and scale. R reloads the shaders.\n"
+           "F12 writes the render to screenshot_NNNN.png, overlay excluded.\n");
     fflush(stdout);
 
     double last_time = glfwGetTime();
     bool mouse_was_down = false;
+    // Capture mode's exit status. False until the image is written, so closing the window
+    // early is reported as the failure it is rather than as a successful capture.
+    bool capture_ok = false;
     // Set when a click lands in the viewport; serviced at the top of the next iteration,
     // because renderer_pick stalls the device and must not run inside a recording frame.
     bool pick_pending = false;
@@ -147,6 +317,14 @@ int main(void)
         if (g_reload_requested) {
             g_reload_requested = false;
             renderer_reload_shaders(&renderer);
+        }
+
+        if (g_screenshot_requested) {
+            g_screenshot_requested = false;
+            char path[64];
+            if (next_screenshot_path(path, sizeof(path))) {
+                renderer_screenshot(&renderer, path);
+            }
         }
 
         // Rebuilds the acceleration structure when the scene was edited. Outside the frame,
@@ -185,7 +363,9 @@ int main(void)
         const float scroll = g_scroll;
         g_scroll = 0.0f;
         const pt_camera_t camera =
-            pt_fly_camera_update(&fly, window, dt, renderer.scene.camera_fov, scroll,
+            pt_fly_camera_update(&fly, window, dt, renderer.scene.camera_fov,
+                                 renderer.scene.camera_aperture,
+                                 renderer.scene.camera_focus_distance, scroll,
                                  ui_captures_keyboard(&ui) || gizmo.active_axis >= 0);
 
         // Kept in step so saving the scene captures wherever the camera ended up. Not an
@@ -229,6 +409,23 @@ int main(void)
         ui_record(&ui, frame);
 
         gpu_frame_end(&frames, &swapchain, frame);
+
+        // Capture mode: stop once the accumulator holds the requested number of samples.
+        // Tested after the frame rather than before it, so the count reflects work that has
+        // actually landed, and outside the frame because the readback stalls the device.
+        if (options.capture) {
+            const uint32_t taken =
+                renderer.accum_frames * renderer.settings.samples_per_frame;
+            if (taken >= options.samples) {
+                // The extension picks the format: a .pfm for the diff script, anything else
+                // for the eye.
+                const char *dot = strrchr(options.capture, '.');
+                capture_ok = dot && strcmp(dot, ".pfm") == 0
+                                 ? renderer_capture_pfm(&renderer, options.capture)
+                                 : renderer_screenshot(&renderer, options.capture);
+                break;
+            }
+        }
     }
 
     // Nothing below may destroy an object the GPU could still be using.
@@ -243,5 +440,5 @@ int main(void)
 
     glfwDestroyWindow(window);
     glfwTerminate();
-    return 0;
+    return options.capture && !capture_ok ? 1 : 0;
 }

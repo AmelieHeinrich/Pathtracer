@@ -145,6 +145,10 @@ bool pt_scene_load(pt_scene_t *scene, const char *path)
                 scene->camera_pitch = strtof(value, NULL);
             } else if (strcmp(key, "fov") == 0) {
                 scene->camera_fov = strtof(value, NULL);
+            } else if (strcmp(key, "aperture") == 0) {
+                scene->camera_aperture = strtof(value, NULL);
+            } else if (strcmp(key, "focus_distance") == 0) {
+                scene->camera_focus_distance = strtof(value, NULL);
             } else {
                 handled = false;
             }
@@ -177,6 +181,19 @@ bool pt_scene_load(pt_scene_t *scene, const char *path)
                 entity->emission_strength = strtof(value, NULL);
             } else if (strcmp(key, "roughness") == 0) {
                 entity->roughness = strtof(value, NULL);
+            } else if (strcmp(key, "metallic") == 0) {
+                entity->metallic = strtof(value, NULL);
+            } else if (strcmp(key, "transmission") == 0) {
+                entity->transmission = strtof(value, NULL);
+            } else if (strcmp(key, "ior") == 0) {
+                entity->ior = strtof(value, NULL);
+            } else if (strcmp(key, "abbe") == 0) {
+                entity->abbe = strtof(value, NULL);
+            } else if (strcmp(key, "absorption") == 0) {
+                entity->absorption[0] = strtof(value, NULL);
+                read_floats(&entity->absorption[1], 2);
+            } else if (strcmp(key, "absorption_distance") == 0) {
+                entity->absorption_distance = strtof(value, NULL);
             } else {
                 handled = false;
             }
@@ -201,6 +218,8 @@ bool pt_scene_load(pt_scene_t *scene, const char *path)
                 read_floats(&light->color[1], 2);
             } else if (strcmp(key, "intensity") == 0) {
                 light->intensity = strtof(value, NULL);
+            } else if (strcmp(key, "temperature") == 0) {
+                light->temperature = strtof(value, NULL);
             } else if (strcmp(key, "range") == 0) {
                 light->range = strtof(value, NULL);
             } else if (strcmp(key, "cone") == 0) {
@@ -252,6 +271,8 @@ bool pt_scene_save(const pt_scene_t *scene, const char *path)
     fprintf(file, "  yaw %g\n", (double)scene->camera_yaw);
     fprintf(file, "  pitch %g\n", (double)scene->camera_pitch);
     fprintf(file, "  fov %g\n", (double)scene->camera_fov);
+    fprintf(file, "  aperture %g\n", (double)scene->camera_aperture);
+    fprintf(file, "  focus_distance %g\n", (double)scene->camera_focus_distance);
 
     for (uint32_t i = 0; i < scene->entity_count; ++i) {
         const pt_entity_t *entity = &scene->entities[i];
@@ -273,6 +294,26 @@ bool pt_scene_save(const pt_scene_t *scene, const char *path)
             fprintf(file, "  emission_strength %g\n", (double)entity->emission_strength);
         }
         fprintf(file, "  roughness   %g\n", (double)entity->roughness);
+        // Each written only when it is doing something, exactly as emission is: an ordinary
+        // opaque surface stays as short as it was before materials existed, and a scene file
+        // diff shows only the entities that actually gained a property.
+        if (entity->metallic != 0.0f) {
+            fprintf(file, "  metallic    %g\n", (double)entity->metallic);
+        }
+        if (entity->transmission != 0.0f) {
+            fprintf(file, "  transmission %g\n", (double)entity->transmission);
+            fprintf(file, "  ior         %g\n", (double)entity->ior);
+            if (entity->abbe != 0.0f) {
+                fprintf(file, "  abbe        %g\n", (double)entity->abbe);
+            }
+            if (entity->absorption[0] != 1.0f || entity->absorption[1] != 1.0f ||
+                entity->absorption[2] != 1.0f) {
+                fprintf(file, "  absorption  %g %g %g\n", (double)entity->absorption[0],
+                        (double)entity->absorption[1], (double)entity->absorption[2]);
+                fprintf(file, "  absorption_distance %g\n",
+                        (double)entity->absorption_distance);
+            }
+        }
     }
 
     for (uint32_t i = 0; i < scene->light_count; ++i) {
@@ -289,6 +330,11 @@ bool pt_scene_save(const pt_scene_t *scene, const char *path)
         fprintf(file, "  color     %g %g %g\n", (double)light->color[0],
                 (double)light->color[1], (double)light->color[2]);
         fprintf(file, "  intensity %g\n", (double)light->intensity);
+        // Only when set, matching how emission and range are written: an ordinary light
+        // stays one line shorter and a warm one stands out in a diff.
+        if (light->temperature != 0.0f) {
+            fprintf(file, "  temperature %g\n", (double)light->temperature);
+        }
         if (light->range != 0.0f) {
             fprintf(file, "  range     %g\n", (double)light->range);
         }

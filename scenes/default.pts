@@ -22,7 +22,9 @@ entity "cube"
   albedo      0.85 0.24 0.18
   roughness   1
 
-# Mirror, so the analytic sphere normals show up as a clean reflection.
+# Mirror, so the analytic sphere normals show up as a clean reflection. A mirror is a smooth
+# *conductor*: metallic 1 is what removes the diffuse base underneath, and the albedo then
+# tints the reflection rather than colouring a surface beneath it.
 entity "sphere"
   shape       sphere
   translation -1.1 0.85 0
@@ -30,6 +32,7 @@ entity "sphere"
   scale       0.85 0.85 0.85
   albedo      0.95 0.95 0.97
   roughness   0
+  metallic    1
 
 entity "cylinder"
   shape       cylinder

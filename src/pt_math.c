@@ -97,7 +97,7 @@ void pt_mat4_transform(float out[4], const pt_mat4_t *m, const float v[3])
 // ---------------------------------------------------------------------------
 
 pt_camera_t pt_camera_look_at(const float position[3], const float target[3],
-                              float fov_degrees)
+                              float fov_degrees, float aperture, float focus_distance)
 {
     pt_camera_t camera = {0};
     memcpy(camera.position, position, sizeof(camera.position));
@@ -111,6 +111,10 @@ pt_camera_t pt_camera_look_at(const float position[3], const float target[3],
     pt_vec3_cross(camera.up, camera.right, camera.forward);
 
     camera.tan_half_fov = tanf(fov_degrees * 0.5f * PT_DEG_TO_RAD);
+    // Negative values are meaningless for both, and a focus plane behind the camera would put
+    // the focal point behind the lens and invert the image.
+    camera.aperture = aperture > 0.0f ? aperture : 0.0f;
+    camera.focus_distance = focus_distance > 1e-3f ? focus_distance : 1e-3f;
     return camera;
 }
 

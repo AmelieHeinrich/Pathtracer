@@ -1,6 +1,9 @@
 #include "scene.h"
 
+#include "spectral.h"
+
 #include "gpu_internal.h"
+#include "mesh.h"
 #include "pt_math.h"
 
 #include <math.h>
@@ -81,19 +84,61 @@ static const VkAabbPositionsKHR PT_UNIT_AABB = {-1.0f, -1.0f, -1.0f, 1.0f, 1.0f,
 // shape and light type tables
 // ---------------------------------------------------------------------------
 
-// One row per shape, so the name, the structure it instances and the hit group it selects can
+// One row per shape, so the name, the geometry it instances and the hit group it selects can
 // never disagree. The UI, the file format and pt_scene_sync all read it.
-static const struct {
-    const char *name;
-    pt_blas_t blas;
+//
+// The analytic rows are statically initialised and the count starts at exactly them, so the
+// table is complete and usable from program start -- pt_scene_default names its entities through
+// pt_shape_name before pt_scene_init has run. register_mesh_shapes then appends one row per
+// baked mesh, which is the whole of what makes a model a first class shape.
+static struct {
+    char name[PT_MAX_NAME];
+    pt_blas_t blas;           // built-in rows only; a mesh carries its own structure
     pt_hit_group_t hit_group;
-} PT_SHAPES[PT_SHAPE_COUNT] = {
-    [PT_SHAPE_PLANE] = {"plane", PT_BLAS_PLANE, PT_HIT_GROUP_MESH},
-    [PT_SHAPE_CUBE] = {"cube", PT_BLAS_CUBE, PT_HIT_GROUP_MESH},
-    [PT_SHAPE_SPHERE] = {"sphere", PT_BLAS_UNIT_AABB, PT_HIT_GROUP_SPHERE},
-    [PT_SHAPE_CYLINDER] = {"cylinder", PT_BLAS_UNIT_AABB, PT_HIT_GROUP_CYLINDER},
-    [PT_SHAPE_CONE] = {"cone", PT_BLAS_UNIT_AABB, PT_HIT_GROUP_CONE},
+    int32_t mesh;             // -1 for a built-in, else an index into the mesh library
+} g_shapes[PT_SHAPE_BUILTIN_COUNT + PT_MAX_MESHES] = {
+    [PT_SHAPE_PLANE] = {"plane", PT_BLAS_PLANE, PT_HIT_GROUP_MESH, -1},
+    [PT_SHAPE_CUBE] = {"cube", PT_BLAS_CUBE, PT_HIT_GROUP_MESH, -1},
+    [PT_SHAPE_SPHERE] = {"sphere", PT_BLAS_UNIT_AABB, PT_HIT_GROUP_SPHERE, -1},
+    [PT_SHAPE_CYLINDER] = {"cylinder", PT_BLAS_UNIT_AABB, PT_HIT_GROUP_CYLINDER, -1},
+    [PT_SHAPE_CONE] = {"cone", PT_BLAS_UNIT_AABB, PT_HIT_GROUP_CONE, -1},
 };
+static uint32_t g_shape_count = PT_SHAPE_BUILTIN_COUNT;
+
+// Appends the mesh library to the registry. Truncating back to the built-ins first makes this
+// idempotent, and keeps every analytic shape's index exactly what its enumerator says -- which
+// is what lets a scene file written before models existed still load unchanged.
+static void register_mesh_shapes(void)
+{
+    g_shape_count = PT_SHAPE_BUILTIN_COUNT;
+
+    for (uint32_t i = 0; i < pt_mesh_count(); ++i) {
+        const pt_mesh_t *mesh = pt_mesh_get(i);
+
+        // A model named after an existing shape would make pt_shape_from_name resolve to
+        // whichever row it hit first, so the file quietly loses. Refuse it instead.
+        pt_shape_t clash;
+        if (pt_shape_from_name(mesh->name, &clash)) {
+            fprintf(stderr, "scene: model '%s' collides with an existing shape, not registered\n",
+                    mesh->name);
+            continue;
+        }
+
+        snprintf(g_shapes[g_shape_count].name, sizeof(g_shapes[g_shape_count].name), "%s",
+                 mesh->name);
+        // A mesh is triangles, so it goes through the same hit group the cube and the plane do:
+        // the shader reaches its vertices through the addresses fill_instance writes, and needs
+        // to know nothing else about it.
+        g_shapes[g_shape_count].hit_group = PT_HIT_GROUP_MESH;
+        g_shapes[g_shape_count].mesh = (int32_t)i;
+        ++g_shape_count;
+    }
+}
+
+uint32_t pt_shape_count(void)
+{
+    return g_shape_count;
+}
 
 static const char *const PT_LIGHT_TYPE_NAMES[PT_LIGHT_TYPE_COUNT] = {
     [PT_LIGHT_POINT] = "point",
@@ -104,13 +149,13 @@ static const char *const PT_LIGHT_TYPE_NAMES[PT_LIGHT_TYPE_COUNT] = {
 
 const char *pt_shape_name(pt_shape_t shape)
 {
-    return shape < PT_SHAPE_COUNT ? PT_SHAPES[shape].name : "unknown";
+    return shape < pt_shape_count() ? g_shapes[shape].name : "unknown";
 }
 
 bool pt_shape_from_name(const char *name, pt_shape_t *out)
 {
-    for (uint32_t i = 0; i < PT_SHAPE_COUNT; ++i) {
-        if (strcmp(name, PT_SHAPES[i].name) == 0) {
+    for (uint32_t i = 0; i < pt_shape_count(); ++i) {
+        if (strcmp(name, g_shapes[i].name) == 0) {
             *out = (pt_shape_t)i;
             return true;
         }
@@ -193,6 +238,10 @@ void pt_scene_default(pt_scene_t *scene)
     scene->camera_yaw = -152.0f;
     scene->camera_pitch = -13.0f;
     scene->camera_fov = 40.0f;
+    // A pinhole by default: depth of field is something to reach for, not something to
+    // discover having been applied.
+    scene->camera_aperture = 0.0f;
+    scene->camera_focus_distance = 10.0f;
 
     ++scene->revision;
 }
@@ -222,6 +271,14 @@ pt_entity_t *pt_scene_add_entity(pt_scene_t *scene, pt_shape_t shape)
     entity->emission[2] = 1.0f;
     entity->emission_strength = 0.0f;
     entity->roughness = 1.0f;
+    // Only the two that must not be zero. A zeroed absorption colour would mean *infinite*
+    // extinction -- instantly black glass -- and a zeroed index would refract nonsensically,
+    // so both are set here for the same reason emission defaults to white above.
+    entity->ior = 1.5f;
+    entity->absorption[0] = 1.0f;
+    entity->absorption[1] = 1.0f;
+    entity->absorption[2] = 1.0f;
+    entity->absorption_distance = 1.0f;
 
     ++scene->revision;
     return entity;
@@ -287,6 +344,12 @@ void pt_scene_remove_light(pt_scene_t *scene, uint32_t index)
 
 void pt_scene_init(pt_scene_t *scene, gpu_device_t *device, gpu_uploader_t *uploader)
 {
+    // Before any geometry of our own: the baked models, so that they are registered as shapes
+    // by the time anything asks to resolve a shape name. renderer_init runs this well before
+    // main.c loads a scene file, which is what lets that file say `shape dragon`.
+    pt_mesh_library_init(device, uploader, PT_ASSET_DIR "/bin");
+    register_mesh_shapes();
+
     // SHADER_DEVICE_ADDRESS so the shader can reach these as pointers; the AS build input
     // bit so they can also feed the geometry build directly.
     const VkBufferUsageFlags geometry_usage =
@@ -355,7 +418,12 @@ static void fill_instance(const pt_scene_t *scene, const pt_entity_t *entity,
                           VkAccelerationStructureInstanceKHR *instance,
                           pt_instance_data_t *data)
 {
-    const pt_shape_t shape = entity->shape < PT_SHAPE_COUNT ? entity->shape : PT_SHAPE_CUBE;
+    // A scene file naming a model that has not been baked leaves an out of range index here,
+    // so this clamp is what stops it from indexing the registry off its end.
+    const pt_shape_t shape = entity->shape < pt_shape_count() ? entity->shape : PT_SHAPE_CUBE;
+    const pt_mesh_t *mesh = g_shapes[shape].mesh >= 0
+                                ? pt_mesh_get((uint32_t)g_shapes[shape].mesh)
+                                : NULL;
 
     VkTransformMatrixKHR transform =
         pt_transform_compose(entity->translation, entity->rotation, entity->scale);
@@ -370,23 +438,53 @@ static void fill_instance(const pt_scene_t *scene, const pt_entity_t *entity,
     *instance = (VkAccelerationStructureInstanceKHR){
         .transform = transform,
         .mask = 0xFF,
-        .instanceShaderBindingTableRecordOffset = (uint32_t)PT_SHAPES[shape].hit_group,
+        .instanceShaderBindingTableRecordOffset = (uint32_t)g_shapes[shape].hit_group,
         .flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR,
-        .accelerationStructureReference = scene->blas[PT_SHAPES[shape].blas].address,
+        // A mesh brings its own structure; the analytic shapes share the scene's three.
+        .accelerationStructureReference = mesh ? mesh->blas.address
+                                              : scene->blas[g_shapes[shape].blas].address,
     };
 
-    *data = (pt_instance_data_t){.roughness = entity->roughness};
+    *data = (pt_instance_data_t){
+        .roughness = entity->roughness,
+        .metallic = entity->metallic,
+        .transmission = entity->transmission,
+        .ior = entity->ior,
+        .abbe = entity->abbe,
+    };
     memcpy(data->albedo, entity->albedo, sizeof(data->albedo));
+
+    // Beer-Lambert, authored as "this colour after travelling this far" and re-expressed here
+    // as "this colour after travelling one unit" -- the same place a light's intensity and
+    // blackbody scale are folded in, and for the same reason.
+    //
+    // Transmittance is multiplicative in distance, so colour = unit^distance and the unit
+    // value is the distance'th root. That leaves the shader a single pow, and leaves the
+    // value inside [0,1] where the spectral upsampling LUT is defined. A white colour gives
+    // exactly one, which is what keeps absorption inert until someone asks for it.
+    const float distance = entity->absorption_distance > 1e-4f ? entity->absorption_distance
+                                                               : 1e-4f;
+    for (uint32_t i = 0; i < 3; ++i) {
+        // Floored above zero: a pure black channel absorbs infinitely, and its root would
+        // reach the shader as a zero that no amount of thickness could ever recover from.
+        const float channel = fminf(fmaxf(entity->absorption[i], 1e-4f), 1.0f);
+        data->attenuation[i] = powf(channel, 1.0f / distance);
+    }
     // Premultiplied here, exactly as a light's colour and intensity are.
     for (uint32_t i = 0; i < 3; ++i) {
         data->emission[i] = entity->emission[i] * entity->emission_strength;
     }
 
-    // Procedural shapes need no vertex data; their addresses stay null.
-    if (PT_SHAPES[shape].blas == PT_BLAS_CUBE) {
+    // Procedural shapes need no vertex data; their addresses stay null. Everything that does
+    // reach closesthit_mesh gets its vertices and indices as raw device addresses, which is why
+    // a baked model needs nothing the cube did not already need.
+    if (mesh) {
+        data->vertices = mesh->vertices.address;
+        data->indices = mesh->indices.address;
+    } else if (g_shapes[shape].blas == PT_BLAS_CUBE) {
         data->vertices = scene->mesh_vertices.address;
         data->indices = scene->mesh_indices.address;
-    } else if (PT_SHAPES[shape].blas == PT_BLAS_PLANE) {
+    } else if (g_shapes[shape].blas == PT_BLAS_PLANE) {
         data->vertices = scene->mesh_vertices.address + PT_PLANE_VERTEX_OFFSET;
         data->indices = scene->mesh_indices.address + PT_PLANE_INDEX_OFFSET;
     }
@@ -414,8 +512,13 @@ static void fill_light(const pt_light_t *light, pt_light_data_t *data)
     }
     pt_vec3_normalize(data->direction);
 
+    // The blackbody normalisation is folded in here, exactly as the intensity is: the shader
+    // then needs no extra multiply, and a temperature changes only the light's colour because
+    // the scale it comes with holds its luminance at 1.
+    data->temperature = light->temperature;
+    const float norm = pt_spectral_blackbody_norm(light->temperature);
     for (uint32_t i = 0; i < 3; ++i) {
-        data->color[i] = light->color[i] * light->intensity;
+        data->color[i] = light->color[i] * light->intensity * norm;
     }
 
     if (light->type != PT_LIGHT_AREA) {
@@ -483,5 +586,9 @@ void pt_scene_free(pt_scene_t *scene, gpu_device_t *device)
     gpu_buffer_destroy(device, &scene->aabbs);
     gpu_buffer_destroy(device, &scene->mesh_indices);
     gpu_buffer_destroy(device, &scene->mesh_vertices);
+    // Symmetric with pt_scene_init, which loaded it. The library outlives any one scene in
+    // principle, but this application has exactly one, so it is torn down with it.
+    pt_mesh_library_free(device);
+    register_mesh_shapes(); // drops the mesh rows, leaving the built-ins intact
     memset(scene, 0, sizeof(*scene));
 }

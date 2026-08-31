@@ -22,6 +22,12 @@
 // So one BLAS over a single unit AABB backs all three, and an instance picks which shape it
 // is purely through instanceShaderBindingTableRecordOffset. Position, orientation and size
 // come from the instance transform, which is why the intersection shaders need no parameters.
+//
+// Baked models join the same scheme rather than sitting beside it. Every .ptm in assets/bin is
+// centred and uniformly scaled into that same [-1,1] box by the baker, and registers itself as
+// another *shape* at startup -- so `shape dragon` is written, parsed, listed and instanced by
+// exactly the code that handles `shape cube`, and a mesh needs no new field on an entity, no
+// second combo in the panel and no new key in the file format. See src/mesh.h.
 
 #define PT_MAX_ENTITIES 256
 #define PT_MAX_LIGHTS 32
@@ -31,13 +37,16 @@
 // authored data
 // ---------------------------------------------------------------------------
 
+// The analytic shapes, which are the only ones known at compile time. A shape *index* is
+// wider than this enum: the baked meshes are appended after PT_SHAPE_BUILTIN_COUNT at startup,
+// so the count to iterate to is pt_shape_count(), never PT_SHAPE_BUILTIN_COUNT.
 typedef enum pt_shape_t {
     PT_SHAPE_PLANE = 0,
     PT_SHAPE_CUBE,
     PT_SHAPE_SPHERE,
     PT_SHAPE_CYLINDER,
     PT_SHAPE_CONE,
-    PT_SHAPE_COUNT,
+    PT_SHAPE_BUILTIN_COUNT,
 } pt_shape_t;
 
 // None of these has geometry in the acceleration structure, which is what lets the
@@ -58,7 +67,7 @@ typedef enum pt_light_type_t {
 
 typedef struct pt_entity_t {
     char name[PT_MAX_NAME];
-    pt_shape_t shape;
+    pt_shape_t shape; // an index into the shape registry, so it may exceed the enum above
 
     float translation[3];
     float rotation[3]; // XYZ Euler, degrees
@@ -70,6 +79,24 @@ typedef struct pt_entity_t {
     float emission[3];
     float emission_strength;
     float roughness; // 1 = fully diffuse, 0 = perfect mirror
+
+    // 0 is a dielectric -- a coloured base under a white specular highlight. 1 is a conductor,
+    // which has no diffuse lobe at all and tints its reflection with `albedo` instead.
+    float metallic;
+    // How much light passes through rather than reflecting. Dielectrics only; a conductor is
+    // opaque by construction.
+    float transmission;
+    float ior; // refractive index at the sodium d-line, 587.6nm
+    // Abbe number, the optical measure of how much the index varies across the visible band.
+    // 0 disables dispersion for this material, which also lets the path keep all four of its
+    // wavelengths instead of collapsing to one -- so it is meaningfully cheaper, not just
+    // simpler. Real glasses run about 20 (dense flint, very dispersive) to 65 (crown).
+    float abbe;
+    // Beer-Lambert absorption, authored as the colour the material becomes at
+    // `absorption_distance` of travel through it. White means no absorption at all.
+    // fill_instance turns the pair into an extinction coefficient.
+    float absorption[3];
+    float absorption_distance;
 } pt_entity_t;
 
 typedef struct pt_light_t {
@@ -80,6 +107,11 @@ typedef struct pt_light_t {
     float direction[3]; // directional and spot; the direction the light points
     float color[3];
     float intensity;
+    // Kelvin. 0 means "no temperature authored": the light keeps the colour it was given,
+    // lit by the default illuminant. Non-zero multiplies a blackbody of that temperature in
+    // on top, normalised so it changes the colour and never the brightness -- which is what
+    // lets every scene written before this existed load unchanged.
+    float temperature;
 
     // Past `range` the light contributes nothing, which bounds how many entities a shadow ray
     // has to be traced for. 0 means unbounded.
@@ -108,8 +140,24 @@ typedef struct pt_instance_data_t {
     float albedo[3];
     float emission[3];
     float roughness; // 1 = fully diffuse, 0 = perfect mirror
-    float pad;       // explicit, so C and Slang agree on the 48 byte stride
+    float metallic;  // this is what the old explicit `pad` became
+    float transmission;
+    float ior;
+    float abbe; // 0 disables dispersion
+    // The authored colour and distance, folded into one: the fraction of light surviving a
+    // *single unit* of travel. Beer-Lambert is then just this raised to the distance, so the
+    // shader needs no logarithm -- and because it stays inside [0,1] it can be turned into a
+    // spectrum by the same upsampling LUT as any other colour, which is what lets a tint
+    // deepen with thickness the way a real one does.
+    float attenuation[3];
 } pt_instance_data_t;
+
+// The device address members force 8 byte alignment, so this struct only ever grows in
+// multiples of 8. Update this number deliberately, and move `struct InstanceData` in
+// shaders/pathtracer.slang in the same commit -- a mismatch here corrupts every material
+// silently rather than failing, which is exactly what this assert exists to prevent.
+_Static_assert(sizeof(pt_instance_data_t) == 72,
+               "pt_instance_data_t must match struct InstanceData in shaders/pathtracer.slang");
 
 // Matches `struct Light` in shaders/pathtracer.slang under scalar layout. Cone angles arrive
 // as cosines and the colour arrives premultiplied by intensity, so the shader does no trig
@@ -124,12 +172,19 @@ typedef struct pt_light_data_t {
     float range;    // 0 = unbounded
     float cos_inner;
     float cos_outer;
+    float temperature; // Kelvin, or 0 for the default illuminant
     // Area lights: the rectangle's two half-edge vectors and its full area, derived here so
     // the shader never has to build a basis or take a cross product per sample.
     float edge_u[3];
     float edge_v[3];
     float area;
 } pt_light_data_t;
+
+// Every member is 4 byte aligned, so this one needs no explicit padding -- but that is a
+// property worth failing the build over rather than rediscovering as a silent mismatch with
+// struct Light in the shader.
+_Static_assert(sizeof(pt_light_data_t) == 21 * sizeof(float),
+               "pt_light_data_t must match struct Light in shaders/pathtracer.slang");
 
 // Hit group indices, which are also the SBT record offsets carried by each instance. The
 // order here is the order the hit groups are declared to the pipeline.
@@ -165,6 +220,10 @@ typedef struct pt_scene_t {
     float camera_yaw;   // degrees
     float camera_pitch; // degrees
     float camera_fov;   // vertical, degrees
+    // Thin lens. 0 is a pinhole, which is what a scene file without these keys loads as, so
+    // every scene authored before depth of field existed still renders exactly as it did.
+    float camera_aperture;
+    float camera_focus_distance;
 
     // Bumped by every edit. pt_scene_sync rebuilds when it moves and the renderer restarts
     // its accumulation on the same signal, so no edit path has to remember to do either.
@@ -206,6 +265,11 @@ void pt_scene_remove_light(pt_scene_t *scene, uint32_t index);
 
 // Name <-> enum. One table each, shared by the UI and the file format so the two can never
 // disagree about what a shape is called.
+//
+// The shape table is built at startup rather than being a constant, because the baked meshes
+// extend it -- but only pt_scene_init writes it, so these stay ordinary lookups. Iterate to
+// pt_shape_count(), which is the built-ins plus however many models were found.
+uint32_t pt_shape_count(void);
 const char *pt_shape_name(pt_shape_t shape);
 bool pt_shape_from_name(const char *name, pt_shape_t *out);
 const char *pt_light_type_name(pt_light_type_t type);

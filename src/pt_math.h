@@ -48,11 +48,23 @@ typedef struct pt_camera_t {
     float right[3];
     float up[3];
     float tan_half_fov;
+    // Thin lens. A zero aperture is a pinhole, which is what every scene that predates these
+    // two fields loads as -- and what keeps pt_screen_to_ray below an exact match for raygen.
+    float aperture;       // lens radius, world units
+    float focus_distance; // where the plane of sharp focus sits, along `forward`
 } pt_camera_t;
 
+// renderer_record memcmps this struct to decide whether to restart the accumulation, which is
+// only exact while it has no padding. All-float members are what guarantees that, and the
+// invariant is worth stating rather than leaving to be noticed -- pt_settings_t carries the
+// same rule for the same reason.
+_Static_assert(sizeof(pt_camera_t) == 15 * sizeof(float),
+               "pt_camera_t must stay padding-free; renderer_record compares it bytewise");
+
 // Points the camera at `target` from `position` with a vertical field of view in degrees.
+// `aperture` of 0 gives a pinhole, in which case `focus_distance` is unused.
 pt_camera_t pt_camera_look_at(const float position[3], const float target[3],
-                              float fov_degrees);
+                              float fov_degrees, float aperture, float focus_distance);
 
 // Builds the same projection raygen traces with, as a matrix: Vulkan clip space, Y down,
 // depth in [0,1]. This is what makes debug lines land exactly on the geometry they annotate.
@@ -63,7 +75,10 @@ pt_mat4_t pt_camera_view_projection(const pt_camera_t *camera, float aspect);
 bool pt_project_to_screen(const pt_mat4_t *view_projection, const float world[3],
                          float viewport_width, float viewport_height, float out_screen[2]);
 
-// The world space ray through a framebuffer pixel, matching raygen's ray for that pixel.
+// The world space ray through a framebuffer pixel. Matches raygen's ray for that pixel
+// exactly at a zero aperture, and matches the ray through the *centre* of the lens otherwise
+// -- which is what a picking or gizmo ray wants, since a lens sample would make a click land
+// somewhere slightly different every time.
 void pt_screen_to_ray(const pt_camera_t *camera, float aspect, float screen_x, float screen_y,
                       float viewport_width, float viewport_height, float out_origin[3],
                       float out_direction[3]);
