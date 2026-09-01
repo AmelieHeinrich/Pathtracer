@@ -18,6 +18,10 @@
 // A distance, not a clip space depth: the debug pass compares it against its own distance
 // from the camera, which avoids ever having to invert a projection.
 #define PT_DEPTH_FORMAT VK_FORMAT_R32_SFLOAT
+// Running sum of squared sample magnitude, which with the sum and the count in `accum` is
+// everything needed to estimate a pixel's own variance. Full float for the same reason the
+// accumulator is: it is a sum that grows without bound.
+#define PT_MOMENT_FORMAT VK_FORMAT_R32_SFLOAT
 // One entity index per pixel. Integer, so it must never be filtered or interpolated.
 #define PT_PICK_FORMAT VK_FORMAT_R32_UINT
 // Half float is ample for a unit vector; the denoiser only ever takes a dot product of two.
@@ -97,6 +101,10 @@ static void write_descriptors(renderer_t *renderer)
         .imageView = renderer->accum.view,
         .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
     };
+    const VkDescriptorImageInfo moment_info = {
+        .imageView = renderer->moment.view,
+        .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+    };
     const VkDescriptorImageInfo depth_info = {
         .imageView = renderer->depth.view,
         .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
@@ -115,6 +123,15 @@ static void write_descriptors(renderer_t *renderer)
     const VkDescriptorImageInfo bluenoise_info = {
         .imageView = pt_bluenoise_image()->view,
         .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+    };
+    // The one piece of bulk scene data that is a descriptor rather than a device address, and
+    // only because there is no room left for a fourth address in the push constants. Like the
+    // instance and light tables it is allocated once at full capacity, so this write stays
+    // valid across every sync and every resize.
+    const VkDescriptorBufferInfo emitter_info = {
+        .buffer = renderer->scene.emitter_data.handle,
+        .offset = 0,
+        .range = VK_WHOLE_SIZE,
     };
 
     const VkWriteDescriptorSet writes[] = {
@@ -174,6 +191,22 @@ static void write_descriptors(renderer_t *renderer)
             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
             .pImageInfo = &bluenoise_info,
         },
+        {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = renderer->set,
+            .dstBinding = 7,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .pBufferInfo = &emitter_info,
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = renderer->set,
+            .dstBinding = 8,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .pImageInfo = &moment_info,
+        },
     };
     vkUpdateDescriptorSets(renderer->device->device, PT_COUNT(writes), writes, 0, NULL);
 }
@@ -227,6 +260,18 @@ static void create_descriptor_objects(renderer_t *renderer)
             .descriptorCount = 1,
             .stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR,
         },
+        {
+            .binding = 7,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR,
+        },
+        {
+            .binding = 8,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR,
+        },
     };
     const VkDescriptorSetLayoutCreateInfo layout_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
@@ -238,7 +283,8 @@ static void create_descriptor_objects(renderer_t *renderer)
 
     const VkDescriptorPoolSize pool_sizes[] = {
         {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
-        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 6},
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 7},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1},
     };
     const VkDescriptorPoolCreateInfo pool_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
@@ -265,6 +311,10 @@ static void create_targets(renderer_t *renderer, VkExtent2D extent)
                                             VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
     renderer->accum = gpu_image_create(renderer->device, extent, PT_ACCUM_FORMAT,
                                        VK_IMAGE_USAGE_STORAGE_BIT);
+    // Read-modify-written alongside the accumulator and by nothing else, so it needs neither
+    // sampling nor transfer.
+    renderer->moment = gpu_image_create(renderer->device, extent, PT_MOMENT_FORMAT,
+                                        VK_IMAGE_USAGE_STORAGE_BIT);
     // Storage because raygen writes it, sampled because the debug pass reads it from a
     // fragment shader, where a writable storage image would need fragmentStoresAndAtomics.
     renderer->depth = gpu_image_create(renderer->device, extent, PT_DEPTH_FORMAT,
@@ -300,7 +350,10 @@ void renderer_init(renderer_t *renderer, gpu_device_t *device)
     renderer->settings = (pt_settings_t){
         .max_bounces = PT_DEFAULT_MAX_BOUNCES,
         .samples_per_frame = 1,
-        .unlit = 0,
+        // Both variance reducers on by default. Neither changes what the image converges to
+        // -- the clamp's bound widens without limit and the adaptive budget only decides
+        // where samples go -- so there is no reason to make the good behaviour opt-in.
+        .flags = PT_FLAG_CLAMP | PT_FLAG_ADAPTIVE,
         .sky_intensity = 1.0f,
         .turbidity = 3.0f,
         .sun_azimuth = 200.0f,
@@ -357,6 +410,7 @@ void renderer_free(renderer_t *renderer)
     gpu_image_destroy(gpu, &renderer->normal);
     gpu_image_destroy(gpu, &renderer->pick);
     gpu_image_destroy(gpu, &renderer->depth);
+    gpu_image_destroy(gpu, &renderer->moment);
     gpu_image_destroy(gpu, &renderer->accum);
     gpu_image_destroy(gpu, &renderer->output);
 
@@ -384,6 +438,7 @@ void renderer_resize(renderer_t *renderer, VkExtent2D extent)
     gpu_image_destroy(renderer->device, &renderer->normal);
     gpu_image_destroy(renderer->device, &renderer->pick);
     gpu_image_destroy(renderer->device, &renderer->depth);
+    gpu_image_destroy(renderer->device, &renderer->moment);
     gpu_image_destroy(renderer->device, &renderer->accum);
     gpu_image_destroy(renderer->device, &renderer->output);
     create_targets(renderer, extent);
@@ -748,28 +803,40 @@ void renderer_record(renderer_t *renderer, gpu_frame_t *frame, const pt_camera_t
     // it after the previous frame's writes and keeps its contents. The one exception is a
     // restart, where the previous contents are about to be ignored and the image may not
     // even be in GENERAL yet because it was only just created.
-    gpu_cmd_image_barrier(cmd, &(gpu_image_barrier_t){
-        .image = renderer->accum.handle,
-        .old_layout = renderer->accum_frames == 0 ? VK_IMAGE_LAYOUT_UNDEFINED
-                                                  : VK_IMAGE_LAYOUT_GENERAL,
-        .new_layout = VK_IMAGE_LAYOUT_GENERAL,
-        .src_stage = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
-        .src_access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-        .dst_stage = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
-        .dst_access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
-                      VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-    });
+    // The moment image is the accumulator's second half and shares its lifetime exactly, so it
+    // takes the same barrier -- including the restart case, where neither has meaningful
+    // contents and the layout may still be UNDEFINED.
+    const VkImage accumulators[] = {renderer->accum.handle, renderer->moment.handle};
+    for (uint32_t i = 0; i < PT_COUNT(accumulators); ++i) {
+        gpu_cmd_image_barrier(cmd, &(gpu_image_barrier_t){
+            .image = accumulators[i],
+            .old_layout = renderer->accum_frames == 0 ? VK_IMAGE_LAYOUT_UNDEFINED
+                                                      : VK_IMAGE_LAYOUT_GENERAL,
+            .new_layout = VK_IMAGE_LAYOUT_GENERAL,
+            .src_stage = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+            .src_access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            .dst_stage = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+            .dst_access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+                          VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        });
+    }
 
-    // All three are fully overwritten every frame like `output`. They are consumed off the
-    // frame path -- depth by the debug pass's fragment shader and by the denoiser, pick by a
-    // host readback, normal by the denoiser -- so the source scope names those rather than
-    // the blit.
+    // These three are consumed off the frame path -- depth by the debug pass's fragment shader
+    // and by the denoiser, pick by a host readback, normal by the denoiser -- so the source
+    // scope names those rather than the blit.
+    //
+    // Their contents are *kept*, unlike `output`. With an adaptive sample budget a pixel that
+    // has already settled traces nothing, and so writes none of these; it has to keep the
+    // geometry it wrote earlier. That is safe because any camera or scene change restarts the
+    // accumulation, and the restart frame traces every pixel -- which is also the one frame
+    // where there is nothing worth keeping, hence the same test the accumulators use.
     const VkImage per_pixel_outputs[] = {renderer->depth.handle, renderer->pick.handle,
                                          renderer->normal.handle};
     for (uint32_t i = 0; i < PT_COUNT(per_pixel_outputs); ++i) {
         gpu_cmd_image_barrier(cmd, &(gpu_image_barrier_t){
             .image = per_pixel_outputs[i],
-            .old_layout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .old_layout = renderer->accum_frames == 0 ? VK_IMAGE_LAYOUT_UNDEFINED
+                                                      : VK_IMAGE_LAYOUT_GENERAL,
             .new_layout = VK_IMAGE_LAYOUT_GENERAL,
             .src_stage = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
                          VK_PIPELINE_STAGE_2_COPY_BIT |
@@ -793,6 +860,7 @@ void renderer_record(renderer_t *renderer, gpu_frame_t *frame, const pt_camera_t
         .camera = *camera,
         .frame_index = renderer->accum_frames,
         .light_count = renderer->scene.light_count,
+        .emitter_count = renderer->scene.emitter_count,
         .settings = renderer->settings,
     };
     vkCmdPushConstants(cmd, renderer->pipeline.layout, GPU_RT_PUSH_CONSTANT_STAGES, 0,

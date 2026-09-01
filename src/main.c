@@ -69,6 +69,12 @@ typedef struct pt_options_t {
     // resolved back must give the colour that was authored, and this is the view that shows
     // exactly that and nothing else.
     bool unlit;
+    // The two variance reducers, both on by default, and both switchable off here for the
+    // same reason --tonemap can be pinned: a capture is only comparable against another one
+    // taken the same way. --no-adaptive matters most, because adaptive sampling turns
+    // --samples from an exact per-pixel count into a per-pixel budget.
+    bool no_clamp;
+    bool no_adaptive;
     // Switches the a-trous filter on. The overlay is the usual way to reach it, but a
     // --capture runs headless to a file and never sees the overlay, so comparing a filtered
     // render against a raw one needs a flag.
@@ -124,6 +130,10 @@ static bool parse_options(int argc, char **argv, pt_options_t *out)
             out->resave = argv[++i];
         } else if (strcmp(argv[i], "--unlit") == 0) {
             out->unlit = true;
+        } else if (strcmp(argv[i], "--no-clamp") == 0) {
+            out->no_clamp = true;
+        } else if (strcmp(argv[i], "--no-adaptive") == 0) {
+            out->no_adaptive = true;
         } else if (strcmp(argv[i], "--denoise") == 0) {
             out->denoise = true;
         } else if (strcmp(argv[i], "--tonemap") == 0 && has_value) {
@@ -134,7 +144,8 @@ static bool parse_options(int argc, char **argv, pt_options_t *out)
             fprintf(stderr,
                     "usage: %s [--scene FILE] [--sky N] [--unlit] [--denoise]"
                     " [--tonemap none|agx|aces|reinhard] [--exposure STOPS]"
-                    " [--turbidity N] [--sun-elevation DEG]"
+                    " [--turbidity N] [--sun-elevation DEG] [--bounces N]"
+                    " [--no-clamp] [--no-adaptive]"
                     " [--capture OUT.png|OUT.pfm [--samples N]]\n",
                     argv[0]);
             return false;
@@ -234,7 +245,13 @@ int main(int argc, char **argv)
         renderer.settings.sky_intensity = options.sky;
     }
     if (options.unlit) {
-        renderer.settings.unlit = 1u;
+        renderer.settings.flags |= PT_FLAG_UNLIT;
+    }
+    if (options.no_clamp) {
+        renderer.settings.flags &= ~PT_FLAG_CLAMP;
+    }
+    if (options.no_adaptive) {
+        renderer.settings.flags &= ~PT_FLAG_ADAPTIVE;
     }
     // Not members of renderer.settings, deliberately: both run over the averaged image and
     // must never restart the accumulation.

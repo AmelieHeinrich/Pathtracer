@@ -1,0 +1,204 @@
+# pathtracer scene v1
+#
+# The thin lens, and what absorption does at small scale.
+#
+#   Pathtracer --scene scenes/gemstones.pts --turbidity 2 --sun-elevation 18 \
+#              --bounces 12 --samples 2048 --capture gemstones.png
+#
+# A scatter of stones on a dark polished floor. The floor is a smooth conductor, so every gem
+# sits on its own reflection, and the sky it reflects is the clean gradient the Preetham model
+# gives at turbidity 2. The sun is high enough to strike sparks off the stones and low enough
+# to keep some direction in the shadows.
+#
+# The aperture is the point of the scene, so it is worth being precise about what it means
+# here: `aperture` is the lens *radius in world units*, not an f-number and not a 0-to-1 dial.
+# A point at depth d is smeared across a circle of diameter 2 * aperture * |1 - d/focus|, and
+# that circle is then magnified by how close d is. Both halves matter, which is why the stones
+# are ranked in a narrow band of depth rather than scattered from under the lens to the
+# horizon: at the same aperture, a stone at half the focus distance blurs three times harder
+# *and* is drawn nearly three times bigger, and it ends up a featureless blob covering the
+# frame.
+#
+# As built: the middle rank is at the focal plane and sharp, the front rank blurs by about
+# eleven pixels and the back rank by about twenty. Raise the aperture for more, but move the
+# ranks in toward 5.45 as you do, or the near stones will swallow the picture again.
+#
+# The colours are absorption, not albedo, which is why the small stones read as pale and the
+# big ones as saturated even where they share a tint. absorption_distance is 0.3 throughout
+# because these are half-metre stones -- the same numbers at the default distance of 1 would
+# barely tint them.
+#
+# No stone touches another. Absorption tracks one medium at a time, so overlapping two
+# transmissive objects gets the boundaries wrong; keep the gaps if you move things around.
+
+camera
+  position 0 0.9 6.2
+  yaw 180
+  pitch -8
+  fov 30
+  aperture 0.11
+  focus_distance 5.45
+
+entity "floor"
+  shape       plane
+  translation 0 0 0
+  rotation    0 0 0
+  scale       60 1 60
+  albedo      0.1 0.1 0.12
+  roughness   0.08
+  metallic    1
+
+# --- front rank, about a unit inside the focal plane: gently soft ------------------------
+
+entity "citrine"
+  shape        sphere
+  translation  -1.05 0.34 1.85
+  rotation     0 0 0
+  scale        0.34 0.34 0.34
+  albedo       1 1 1
+  roughness    0
+  transmission 1
+  ior          1.55
+  absorption   0.9 0.62 0.12
+  absorption_distance 0.3
+
+entity "ruby"
+  shape        sphere
+  translation  0.85 0.42 1.7
+  rotation     0 0 0
+  scale        0.42 0.42 0.42
+  albedo       1 1 1
+  roughness    0
+  transmission 1
+  ior          1.77
+  abbe         72
+  absorption   0.72 0.06 0.1
+  absorption_distance 0.3
+
+entity "gold bead"
+  shape       sphere
+  translation 0 0.28 1.3
+  rotation    0 0 0
+  scale       0.28 0.28 0.28
+  albedo      1 0.766 0.336
+  roughness   0.05
+  metallic    1
+
+# --- middle rank, on the focal plane: this is what should be sharp -----------------------
+
+entity "flint"
+  shape        sphere
+  translation  -1.7 0.4 0.35
+  rotation     0 0 0
+  scale        0.4 0.4 0.4
+  albedo       1 1 1
+  roughness    0
+  transmission 1
+  ior          1.785
+  abbe         26
+
+entity "diamond"
+  shape        sphere
+  translation  -0.55 0.46 0.75
+  rotation     0 0 0
+  scale        0.46 0.46 0.46
+  albedo       1 1 1
+  roughness    0
+  transmission 1
+  ior          2.417
+  abbe         55
+
+entity "amethyst"
+  shape        sphere
+  translation  0.42 0.38 0.55
+  rotation     0 0 0
+  scale        0.38 0.38 0.38
+  albedo       1 1 1
+  roughness    0
+  transmission 1
+  ior          1.54
+  absorption   0.52 0.26 0.78
+  absorption_distance 0.3
+
+entity "sapphire"
+  shape        sphere
+  translation  1.5 0.44 0.9
+  rotation     0 0 0
+  scale        0.44 0.44 0.44
+  albedo       1 1 1
+  roughness    0
+  transmission 1
+  ior          1.77
+  abbe         72
+  absorption   0.1 0.24 0.78
+  absorption_distance 0.3
+
+# --- back rank, well past focus: soft, and reading mostly as reflected sky ----------------
+
+entity "emerald"
+  shape        sphere
+  translation  -0.95 0.5 -1.75
+  rotation     0 0 0
+  scale        0.5 0.5 0.5
+  albedo       1 1 1
+  roughness    0
+  transmission 1
+  ior          1.577
+  abbe         70
+  absorption   0.22 0.75 0.42
+  absorption_distance 0.3
+
+entity "zirconia"
+  shape        sphere
+  translation  0.75 0.36 -1.9
+  rotation     0 0 0
+  scale        0.36 0.36 0.36
+  albedo       1 1 1
+  roughness    0
+  transmission 1
+  ior          2.16
+  abbe         30
+
+entity "silver bead"
+  shape       sphere
+  translation 1.85 0.3 -1.5
+  rotation    0 0 0
+  scale       0.3 0.3 0.3
+  albedo      0.972 0.96 0.915
+  roughness   0.04
+  metallic    1
+
+entity "smoke"
+  shape        sphere
+  translation  -2.05 0.32 -2.4
+  rotation     0 0 0
+  scale        0.32 0.32 0.32
+  albedo       1 1 1
+  roughness    0
+  transmission 1
+  ior          1.52
+  absorption   0.35 0.35 0.38
+  absorption_distance 0.3
+
+entity "jade"
+  shape        sphere
+  translation  1.75 0.34 -2.8
+  rotation     0 0 0
+  scale        0.34 0.34 0.34
+  albedo       1 1 1
+  roughness    0.35
+  transmission 1
+  ior          1.66
+  absorption   0.32 0.68 0.44
+  absorption_distance 0.3
+
+# A soft key from camera-left, warm against the blue the sky is already supplying. Small
+# enough to keep a direction in the highlights; large enough that the shadows do not go hard.
+light "key"
+  type        area
+  position    -2.5 4 3
+  direction   0.45 -1 -0.4
+  color       1 1 1
+  intensity   12
+  temperature 5600
+  size        1.5 1.5

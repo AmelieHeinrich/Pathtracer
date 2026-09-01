@@ -10,9 +10,16 @@
 # so each probe should vanish against the background -- and any probe that does not is a BSDF
 # that is losing or inventing energy.
 #
-# This is deliberately built out of an emissive *instance* rather than the sky, because an
-# emissive instance is found by BSDF rays alone. That is exactly the path being tested, and it
-# means the test needs no code and no special render mode.
+# This is deliberately built out of an emissive *instance* rather than the sky, because that
+# path is found by BSDF sampling and BSDF sampling is exactly what is on trial. The test needs
+# no code and no special render mode as a result.
+#
+# The enclosure is a sphere for the same reason, and that is load bearing rather than
+# incidental. Emissive geometry is sampled explicitly where it can be -- see pt_emitter_data_t
+# -- but only for the flat-faced shapes, `plane` and `cube`. A sphere has no such sampler, so
+# every one of these probes is lit purely by rays the BSDF chose, with nothing else propping
+# the answer up. Rebuild the enclosure out of six cubes and the test still passes, but it
+# stops testing what it was written to test.
 #
 # Expect the rough probes to come out slightly dark. Single-scattering GGX genuinely loses the
 # energy that would have taken a second bounce across the microsurface, and the deficit grows

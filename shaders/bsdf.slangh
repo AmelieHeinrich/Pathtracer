@@ -423,7 +423,7 @@ Spectrum bsdf_eval(Surface s, float3 wo_world, float3 wi_world)
 // sample, for the path
 // ---------------------------------------------------------------------------
 
-BsdfSample bsdf_sample(Surface s, float3 wo_world, inout Rng rng)
+BsdfSample bsdf_sample(Surface s, float3 wo_world, inout Sampler sampler)
 {
     BsdfSample result;
     result.direction = float3(0.0f, 0.0f, 1.0f);
@@ -441,7 +441,7 @@ BsdfSample bsdf_sample(Surface s, float3 wo_world, inout Rng rng)
     // A transmissive material is a blend of two behaviours, so pick one and divide its
     // probability back out. Any split is unbiased; this one has the property that a fully
     // transmissive material never wastes a sample on a diffuse lobe it does not have.
-    if (s.transmission > 0.0f && rand(rng) < s.transmission) {
+    if (s.transmission > 0.0f && sampler_next(sampler) < s.transmission) {
         // The four wavelengths only refract together if the index is the same for all four.
         const bool dispersive = s.ior.x != s.ior.y;
         const float ior = s.ior.x; // the hero; the others are dropped by the caller
@@ -457,8 +457,8 @@ BsdfSample bsdf_sample(Surface s, float3 wo_world, inout Rng rng)
         // to stay exactly what it was or every glass path takes a different route.
         float3 h = float3(0.0f, 0.0f, 1.0f);
         if (s.alpha >= PT_GGX_DELTA) {
-            const float vndf_u1 = rand(rng);
-            const float vndf_u2 = rand(rng);
+            const float vndf_u1 = sampler_next(sampler);
+            const float vndf_u2 = sampler_next(sampler);
             h = sample_vndf(wo, s.alpha, vndf_u1, vndf_u2);
         }
 
@@ -476,7 +476,7 @@ BsdfSample bsdf_sample(Surface s, float3 wo_world, inout Rng rng)
         // term cancel out of the weight entirely -- and it is also why total internal
         // reflection needs no special case: fresnel_dielectric returns 1 and this always
         // takes the reflecting branch.
-        if (rand(rng) < fresnel) {
+        if (sampler_next(sampler) < fresnel) {
             wi_h = float3(-wo_h.x, -wo_h.y, wo_h.z);
             result.transmitted = false;
         } else if (refract_local(wo_h, eta, wi_h)) {
@@ -505,7 +505,7 @@ BsdfSample bsdf_sample(Surface s, float3 wo_world, inout Rng rng)
 
     const float p_specular = specular_probability(s);
 
-    if (rand(rng) < p_specular) {
+    if (sampler_next(sampler) < p_specular) {
         float3 wi;
         Spectrum weight;
 
@@ -517,8 +517,8 @@ BsdfSample bsdf_sample(Surface s, float3 wo_world, inout Rng rng)
         } else {
             // Named for the unspecified argument evaluation order; see the transmission
             // branch above.
-            const float vndf_u1 = rand(rng);
-            const float vndf_u2 = rand(rng);
+            const float vndf_u1 = sampler_next(sampler);
+            const float vndf_u2 = sampler_next(sampler);
             const float3 h = sample_vndf(wo, s.alpha, vndf_u1, vndf_u2);
             wi = reflect(-wo, h);
             if (wi.z <= 0.0f) {
@@ -538,8 +538,8 @@ BsdfSample bsdf_sample(Surface s, float3 wo_world, inout Rng rng)
 
     // The diffuse lobe. A cosine-weighted direction against a Lambertian f makes f*cos/pdf
     // collapse to the albedo, which is the whole reason for pairing the two.
-    const float u1 = rand(rng);
-    const float u2 = rand(rng);
+    const float u1 = sampler_next(sampler);
+    const float u2 = sampler_next(sampler);
     const float r = sqrt(u1);
     const float phi = 6.28318530718f * u2;
     const float3 wi = float3(r * cos(phi), r * sin(phi), sqrt(max(0.0f, 1.0f - u1)));

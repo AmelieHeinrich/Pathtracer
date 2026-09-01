@@ -1,0 +1,129 @@
+# pathtracer scene v1
+#
+# Outdoors, into a low sun. No lights and no emitters at all -- the sky is the entire rig.
+#
+#   Pathtracer --scene scenes/golden_hour.pts --sun-elevation 6 --turbidity 4 \
+#              --bounces 10 --samples 2048 --exposure -1 --capture golden_hour.png
+#
+# The camera faces the sun, so the metals are rimmed rather than lit and the shadows run
+# toward the viewer instead of away. At elevation 6 the Preetham dome has gone properly warm
+# and the sun disc itself sits about eight degrees above frame centre, inside the field -- it
+# is meant to be in shot, and --exposure -1 is there to stop it taking the rest of the image
+# with it.
+#
+# IMPORTANT: the composition is built around the default sun azimuth of 200 degrees, which is
+# the one sky setting with no command-line flag. At azimuth 200 the sun lies toward
+# (-0.34, ., +0.94), which is what the camera yaw of -20 is pointing at. Turn the azimuth dial
+# in the render panel and the whole scene is lit from the wrong side; elevation and turbidity
+# are safe to play with.
+#
+# Turbidity 4 is a slightly hazy day. Lower it toward 2 for thin alpine air and a harder sun,
+# raise it toward 8 and the low sun turns orange and the shadows fill in.
+#
+# The two glass spheres sit between the camera and the sun on purpose: a clear sphere with the
+# sun behind it stops being an object and becomes a lens.
+
+camera
+  position 2.2 1.5 -7
+  yaw -20
+  pitch -2
+  fov 42
+  aperture 0.03
+  focus_distance 9
+
+entity "ground"
+  shape       plane
+  translation 0 0 0
+  rotation    0 0 0
+  scale       200 1 200
+  albedo      0.32 0.3 0.27
+  roughness   1
+
+# Chrome, near enough a mirror, so at this sun angle it is mostly a picture of the sky with a
+# hard sun glint on the shoulder.
+entity "teapot"
+  shape       teapot
+  translation -1.9 0.637 1.1
+  rotation    0 -35 0
+  scale       1.3 1.3 1.3
+  albedo      0.55 0.556 0.554
+  roughness   0.02
+  metallic    1
+
+# Tarnished gold: rough enough that the sun spreads into a broad warm sheen down the back
+# rather than a point, which is what separates a worn metal from a polished one.
+entity "bunny"
+  shape       bunny
+  translation 1.4 1.386 2.6
+  rotation    0 -160 0
+  scale       1.4 1.4 1.4
+  albedo      0.82 0.63 0.31
+  roughness   0.45
+  metallic    1
+
+entity "dragon"
+  shape       dragon
+  translation -0.2 1.496 5.6
+  rotation    -90 200 0
+  scale       2.2 2.2 2.2
+  albedo      0.955 0.638 0.538
+  roughness   0.1
+  metallic    1
+
+# Crown glass, between the camera and the sun. Low dispersion, so these stay clean and bright
+# rather than fringing -- the fire is in scenes/prism.pts, this is the lens.
+entity "lens near"
+  shape        sphere
+  translation  0.9 0.55 -2.4
+  rotation     0 0 0
+  scale        0.55 0.55 0.55
+  albedo       1 1 1
+  roughness    0
+  transmission 1
+  ior          1.517
+  abbe         64
+
+entity "lens far"
+  shape        sphere
+  translation  -1.05 0.75 -0.6
+  rotation     0 0 0
+  scale        0.75 0.75 0.75
+  albedo       1 1 1
+  roughness    0
+  transmission 1
+  ior          1.517
+  abbe         64
+
+# Dark, rough, and far away: these exist to put edges at three different distances between the
+# subjects and the horizon, so the haze has something to separate.
+entity "monolith a"
+  shape       cube
+  translation -7.5 2.4 9
+  rotation    0 12 0
+  scale       0.5 2.4 0.5
+  albedo      0.16 0.15 0.14
+  roughness   0.95
+
+entity "monolith b"
+  shape       cube
+  translation 6.2 3.2 13
+  rotation    0 -25 0
+  scale       0.6 3.2 0.6
+  albedo      0.16 0.15 0.14
+  roughness   0.95
+
+entity "monolith c"
+  shape       cylinder
+  translation -4 1.8 17
+  rotation    0 0 0
+  scale       0.7 1.8 0.7
+  albedo      0.18 0.17 0.16
+  roughness   0.95
+
+entity "monolith d"
+  shape       cone
+  translation 10 2.6 20
+  rotation    0 0 0
+  scale       1.4 2.6 1.4
+  albedo      0.16 0.15 0.14
+  roughness   0.95

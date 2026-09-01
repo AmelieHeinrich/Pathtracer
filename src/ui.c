@@ -868,7 +868,9 @@ void ui_draw_overlay(ui_t *ui, renderer_t *renderer, gizmo_selection_t *selectio
         // Nuklear's widgets work on int, while pt_settings_t is all uint32_t so that the
         // memcmp in renderer_record has no padding to trip over. Hence the copy out and
         // back rather than casting the members in place.
-        int unlit = renderer->settings.unlit != 0;
+        int unlit = (renderer->settings.flags & PT_FLAG_UNLIT) != 0;
+        int clamp_fireflies = (renderer->settings.flags & PT_FLAG_CLAMP) != 0;
+        int adaptive = (renderer->settings.flags & PT_FLAG_ADAPTIVE) != 0;
         int bounces = (int)renderer->settings.max_bounces;
         int samples = (int)renderer->settings.samples_per_frame;
 
@@ -905,7 +907,21 @@ void ui_draw_overlay(ui_t *ui, renderer_t *renderer, gizmo_selection_t *selectio
         nk_property_float(ctx, "Sun size", 0.1f, &renderer->settings.sun_angular_diameter,
                           20.0f, 0.1f, 0.05f);
 
-        renderer->settings.unlit = unlit ? 1u : 0u;
+        // The two variance reducers. Both are estimator-side rather than image-side: neither
+        // one ever looks at a neighbouring pixel, which is what separates them from the
+        // denoiser below. Switch them off to see what the raw estimator is doing.
+        nk_layout_row_dynamic(ctx, 22.0f, 2);
+        // Holds a single sample to a multiple of the pixel's running mean, with the multiple
+        // widening as the count grows. Kills the white specks that a caustic found by chance
+        // leaves behind, without permanently eating the energy a fixed clamp would.
+        nk_checkbox_label(ctx, "Clamp spikes", &clamp_fireflies);
+        // Skips pixels that have already settled and spends what they would have cost on the
+        // ones that have not. Makes "Samples" a budget rather than an exact count.
+        nk_checkbox_label(ctx, "Adaptive", &adaptive);
+
+        renderer->settings.flags = (unlit ? PT_FLAG_UNLIT : 0u) |
+                                   (clamp_fireflies ? PT_FLAG_CLAMP : 0u) |
+                                   (adaptive ? PT_FLAG_ADAPTIVE : 0u);
         renderer->settings.max_bounces = (uint32_t)bounces;
         renderer->settings.samples_per_frame = (uint32_t)samples;
 

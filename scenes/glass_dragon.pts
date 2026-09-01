@@ -1,0 +1,83 @@
+# pathtracer scene v1
+#
+# One subject, backlit, in amber glass.
+#
+#   Pathtracer --scene scenes/glass_dragon.pts --sky 0 --bounces 16 --samples 4096 \
+#              --capture glass_dragon.png
+#
+# The dragon is dense flint with amber absorption, standing against a wall that is itself the
+# light. Everything interesting here is Beer-Lambert: the tint is not a surface colour, it is
+# what happens to light on its way through, so the thin parts of the mesh -- the wings, the
+# tail, the edges of the jaw -- stay pale and the thick of the body goes deep orange and
+# nearly opaque. A surface colour cannot do that, and a solid subject is the clearest place to
+# see it. absorption_distance is 1.5 against a body about 3 units across, which puts the
+# darkest part of the chest a couple of distances deep.
+#
+# The backdrop is an emissive slab rather than an area light, and the difference is the whole
+# lighting design. An area light is not in the acceleration structure, so it can only ever be
+# reached by a shadow ray -- and a shadow ray that crossed a transmissive surface from behind
+# is discarded rather than trusted, because the straight line it assumed is not the path light
+# takes through solid glass. An area light here would give a lit dragon with nothing behind it.
+# The slab is real geometry, so a bounce ray can travel through the mesh and arrive at it,
+# refracting properly on the way. That path is long -- floor, in, several internal reflections,
+# out, backdrop -- so --bounces 16 is doing real work; drop it to 5 and the interior collapses.
+#
+# Being a `cube`, the slab is also sampled explicitly wherever that is any use, which is most
+# of the frame: the floor and the near side of the dragon settle quickly. It is only the paths
+# that arrive *through* the glass that fall back on chance, because the vertex before the light
+# is a delta and there is no direction to connect toward. Those are the last thing to converge.
+#
+# The rim is cool and from the front left, purely to keep the silhouette from merging into the
+# glow behind it. It is an ordinary area light; the dragon reads it two-sided because it is
+# transmissive.
+#
+# Slow scene: the dragon is about 2.3M triangles. Trim overall brightness with --exposure.
+
+camera
+  position 0.9 1.9 7.4
+  yaw 186
+  pitch -6
+  fov 36
+  aperture 0.02
+  focus_distance 7.2
+
+entity "floor"
+  shape       cube
+  translation 0 -0.1 0
+  rotation    0 0 0
+  scale       8 0.1 8
+  albedo      0.12 0.12 0.13
+  roughness   0.3
+
+entity "dragon"
+  shape        dragon
+  translation  0 1.29 0
+  rotation     -90 25 0
+  scale        1.9 1.9 1.9
+  albedo       1 1 1
+  roughness    0
+  transmission 1
+  ior          1.785
+  abbe         26
+  absorption   0.85 0.45 0.1
+  absorption_distance 1.1
+
+# The light, and the background, and the thing the glass is showing you. Black albedo: it
+# emits, it does not also bounce.
+entity "backdrop"
+  shape             cube
+  translation       0 3.5 -4.5
+  rotation          0 0 0
+  scale             9 3.5 0.05
+  albedo            0 0 0
+  emission          1 0.93 0.82
+  emission_strength 1.5
+  roughness         1
+
+light "rim"
+  type      area
+  position  -4 3.2 2.2
+  direction 0.8 -0.35 -0.5
+  color     0.7 0.8 1
+  intensity 6
+  size      1.2 1.2

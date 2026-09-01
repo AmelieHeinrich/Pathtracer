@@ -391,6 +391,11 @@ void pt_scene_init(pt_scene_t *scene, gpu_device_t *device, gpu_uploader_t *uplo
                                           VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
                                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                                           GPU_MEMORY_UPLOAD);
+    scene->emitter_data =
+        gpu_buffer_create(device, PT_MAX_EMITTERS * sizeof(pt_emitter_data_t),
+                          VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                          GPU_MEMORY_UPLOAD);
 
     // Forces the first sync regardless of what the authored data's revision happens to be.
     scene->synced_revision = scene->revision - 1;
@@ -490,6 +495,121 @@ static void fill_instance(const pt_scene_t *scene, const pt_entity_t *entity,
     }
 }
 
+// Gathers the emissive entities the integrator can sample explicitly, and hands each matching
+// instance the sampling density that makes the two routes to it agree.
+//
+// Only `plane` and `cube` qualify. Both are the unit shape under an affine transform, so the
+// three columns of that transform are already the half-axes of the result -- a cube spans
+// +-u +-v +-w about its centre, and a plane is the one parallelogram spanned by u and w. No
+// triangle table, no cumulative distribution, and nothing to rebuild when a light is dragged.
+//
+// The single `emitter_pdf_area` per instance is what keeps the multiple importance weighting
+// cheap on the other side, and it is exact rather than an approximation. Sampling picks an
+// emitter uniformly and then one of its faces in proportion to that face's area, so the
+// density at a point on a face of area `a` is
+//
+//     (1 / count) * (a / total) * (1 / a)  =  1 / (count * total)
+//
+// -- the face area cancels. One number therefore covers the whole surface of a box whose six
+// faces are all different sizes, which is exactly what a scaled slab is.
+static void fill_emitters(const pt_scene_t *scene, pt_emitter_data_t *emitters,
+                          uint32_t *out_count, pt_instance_data_t *instances)
+{
+    uint32_t count = 0;
+
+    for (uint32_t i = 0; i < scene->entity_count; ++i) {
+        const pt_entity_t *entity = &scene->entities[i];
+
+        instances[i].emitter_pdf_area = 0.0f;
+
+        // `continue` rather than `break`, so that every instance is still cleared above even
+        // once the table is full. Unreachable as things stand -- there is one emitter slot per
+        // entity -- but a partly stale pdf on the instances past the cap would be a silent
+        // wrong answer rather than a visible one, which is not a thing to leave to a constant.
+        if (count >= PT_MAX_EMITTERS) {
+            continue;
+        }
+        if (entity->emission_strength <= 0.0f) {
+            continue;
+        }
+        const bool coloured = entity->emission[0] > 0.0f || entity->emission[1] > 0.0f ||
+                              entity->emission[2] > 0.0f;
+        if (!coloured) {
+            continue;
+        }
+        const bool is_box = entity->shape == PT_SHAPE_CUBE;
+        if (!is_box && entity->shape != PT_SHAPE_PLANE) {
+            continue; // sampled by BSDF rays alone, exactly as before
+        }
+
+        const VkTransformMatrixKHR m =
+            pt_transform_compose(entity->translation, entity->rotation, entity->scale);
+        if (!transform_is_finite(&m)) {
+            continue; // fill_instance has already reported it and fallen back to identity
+        }
+
+        // The columns of the linear part: the images of the object space axes, which for
+        // these two shapes are the half-axes of the transformed shape itself.
+        const float col_x[3] = {m.matrix[0][0], m.matrix[1][0], m.matrix[2][0]};
+        const float col_y[3] = {m.matrix[0][1], m.matrix[1][1], m.matrix[2][1]};
+        const float col_z[3] = {m.matrix[0][2], m.matrix[1][2], m.matrix[2][2]};
+
+        pt_emitter_data_t *emitter = &emitters[count];
+        *emitter = (pt_emitter_data_t){
+            .instance = i,
+            .is_box = is_box ? 1u : 0u,
+        };
+        emitter->center[0] = m.matrix[0][3];
+        emitter->center[1] = m.matrix[1][3];
+        emitter->center[2] = m.matrix[2][3];
+
+        // A plane is the quad in its own XZ, so its two half-edges are the x and z columns and
+        // the y column -- which scales a direction the quad has no extent in -- is dropped.
+        memcpy(emitter->axis_u, col_x, sizeof(emitter->axis_u));
+        memcpy(emitter->axis_v, is_box ? col_y : col_z, sizeof(emitter->axis_v));
+        if (is_box) {
+            memcpy(emitter->axis_w, col_z, sizeof(emitter->axis_w));
+        }
+
+        // |a x b| is the area of the parallelogram they span, and each of these axes is a
+        // *half* edge, so a face spanned by two of them has four times that.
+        float cross_uv[3];
+        pt_vec3_cross(cross_uv, emitter->axis_u, emitter->axis_v);
+        float area;
+        if (is_box) {
+            float cross_vw[3];
+            float cross_wu[3];
+            pt_vec3_cross(cross_vw, emitter->axis_v, emitter->axis_w);
+            pt_vec3_cross(cross_wu, emitter->axis_w, emitter->axis_u);
+            // Six faces in three opposing pairs, so twice the sum of the three distinct ones.
+            area = 8.0f * (pt_vec3_length(cross_uv) + pt_vec3_length(cross_vw) +
+                           pt_vec3_length(cross_wu));
+        } else {
+            area = 4.0f * pt_vec3_length(cross_uv);
+        }
+        // A collapsed scale leaves nothing to sample and would divide by zero below. It still
+        // glows for a BSDF ray; it just cannot be aimed at.
+        if (!(area > 0.0f) || !isfinite(area)) {
+            continue;
+        }
+        emitter->area = area;
+
+        // The same premultiplied radiance fill_instance wrote, read back rather than
+        // recomputed so the two can never drift apart.
+        memcpy(emitter->emission, instances[i].emission, sizeof(emitter->emission));
+
+        ++count;
+    }
+
+    *out_count = count;
+
+    // Second pass, because the density depends on how many emitters there turned out to be.
+    for (uint32_t i = 0; i < count; ++i) {
+        instances[emitters[i].instance].emitter_pdf_area =
+            1.0f / ((float)count * emitters[i].area);
+    }
+}
+
 static void fill_light(const pt_light_t *light, pt_light_data_t *data)
 {
     *data = (pt_light_data_t){
@@ -568,6 +688,10 @@ bool pt_scene_sync(pt_scene_t *scene, gpu_device_t *device, gpu_uploader_t *uplo
         fill_light(&scene->lights[i], &lights[i]);
     }
 
+    // After the instances, because it reads the premultiplied emission they carry and writes
+    // the sampling density back into them.
+    fill_emitters(scene, scene->emitter_data.mapped, &scene->emitter_count, data);
+
     gpu_accel_destroy(device, &scene->tlas);
     scene->tlas = gpu_tlas_build(device, uploader, instances, scene->entity_count);
 
@@ -581,6 +705,7 @@ void pt_scene_free(pt_scene_t *scene, gpu_device_t *device)
     for (uint32_t i = 0; i < PT_BLAS_COUNT; ++i) {
         gpu_accel_destroy(device, &scene->blas[i]);
     }
+    gpu_buffer_destroy(device, &scene->emitter_data);
     gpu_buffer_destroy(device, &scene->light_data);
     gpu_buffer_destroy(device, &scene->instance_data);
     gpu_buffer_destroy(device, &scene->aabbs);

@@ -32,6 +32,9 @@
 #define PT_MAX_ENTITIES 256
 #define PT_MAX_LIGHTS 32
 #define PT_MAX_NAME 48
+// Emitters are a subset of the entities -- the emissive ones the integrator can sample
+// explicitly -- so at worst every entity is one. See pt_emitter_data_t.
+#define PT_MAX_EMITTERS PT_MAX_ENTITIES
 
 // ---------------------------------------------------------------------------
 // authored data
@@ -55,8 +58,9 @@ typedef enum pt_shape_t {
 // alone -- see the emission rule in shaders/pathtracer.slang -- which keeps that true while
 // still letting you see the panel.
 //
-// A shape that glows is a different thing: an entity with a non-zero emission, found by BSDF
-// rays only. Noisier, but it can be any shape.
+// A shape that glows is a different thing: an entity with a non-zero emission, which unlike
+// these is real geometry a BSDF ray can land on. It can be any shape, and if that shape is
+// flat-faced it is sampled explicitly as well -- see pt_emitter_data_t.
 typedef enum pt_light_type_t {
     PT_LIGHT_POINT = 0,
     PT_LIGHT_DIRECTIONAL,
@@ -150,13 +154,24 @@ typedef struct pt_instance_data_t {
     // spectrum by the same upsampling LUT as any other colour, which is what lets a tint
     // deepen with thickness the way a real one does.
     float attenuation[3];
+    // The probability density, in *area* measure, with which next event estimation would have
+    // sampled any given point of this entity -- or 0 when it is not one the integrator can
+    // sample explicitly. Carried per instance so a bounce ray that lands on an emitter can
+    // work out its MIS weight from the instance table alone, with no search through the
+    // emitter list. See fill_emitters for why a single number covers the whole surface even
+    // when its faces differ in size.
+    float emitter_pdf_area;
+    // The device addresses above force 8 byte alignment on the struct, so it is padded to a
+    // multiple of 8 whether this is written or not. Spelled out rather than left implicit,
+    // because the assert below states a number the reader has to be able to derive.
+    float pad;
 } pt_instance_data_t;
 
 // The device address members force 8 byte alignment, so this struct only ever grows in
 // multiples of 8. Update this number deliberately, and move `struct InstanceData` in
 // shaders/pathtracer.slang in the same commit -- a mismatch here corrupts every material
 // silently rather than failing, which is exactly what this assert exists to prevent.
-_Static_assert(sizeof(pt_instance_data_t) == 72,
+_Static_assert(sizeof(pt_instance_data_t) == 80,
                "pt_instance_data_t must match struct InstanceData in shaders/pathtracer.slang");
 
 // Matches `struct Light` in shaders/pathtracer.slang under scalar layout. Cone angles arrive
@@ -185,6 +200,45 @@ typedef struct pt_light_data_t {
 // struct Light in the shader.
 _Static_assert(sizeof(pt_light_data_t) == 21 * sizeof(float),
                "pt_light_data_t must match struct Light in shaders/pathtracer.slang");
+
+// An emissive entity the integrator can aim a shadow ray at, rather than having to find by
+// chance. Matches `struct Emitter` in shaders/pathtracer.slang under scalar layout.
+//
+// Only the two flat-faced shapes qualify -- `plane` and `cube` -- because those are the two
+// whose surface is a handful of parallelograms that fall straight out of the instance
+// transform, with no per-triangle table and no cumulative distribution to build. That covers
+// every panel, slab and light box, which is what emissive geometry is overwhelmingly used
+// for. An emissive sphere or dragon keeps the behaviour it always had: found by BSDF rays
+// alone, no explicit sampling, and correspondingly noisy. That is a deliberate line rather
+// than an oversight -- see scenes/furnace.pts, whose whole point is to exercise the
+// BSDF-only route.
+//
+// The geometry is stored as a centre and three half-axes, which is exactly what the unit
+// shapes become under a transform: a cube spans +-axis_u +-axis_v +-axis_w about its centre,
+// and a plane is the single parallelogram spanned by axis_u and axis_v.
+typedef struct pt_emitter_data_t {
+    float center[3];
+    float axis_u[3];
+    float axis_v[3];
+    // The third half-axis of a box. Left zero for a quad, where it has no meaning.
+    float axis_w[3];
+    // Radiance, already premultiplied by emission_strength -- the same value the matching
+    // instance carries, so the two routes to this surface agree to the bit.
+    float emission[3];
+    // Total emitting surface area: six faces for a box, one for a quad. The sampling density
+    // is uniform over all of it.
+    float area;
+    // Which instance this emitter is, so the integrator can tell a shadow ray that reached
+    // the light from one that was stopped by something else.
+    uint32_t instance;
+    uint32_t is_box; // 1: six faces from the three half-axes. 0: one quad from u and v.
+} pt_emitter_data_t;
+
+// Every member is 4 byte aligned, so like pt_light_data_t this needs no explicit padding --
+// and like it, that is worth failing the build over rather than rediscovering as a silent
+// mismatch with the shader.
+_Static_assert(sizeof(pt_emitter_data_t) == 18 * sizeof(float),
+               "pt_emitter_data_t must match struct Emitter in shaders/pathtracer.slang");
 
 // Hit group indices, which are also the SBT record offsets carried by each instance. The
 // order here is the order the hit groups are declared to the pipeline.
@@ -240,6 +294,12 @@ typedef struct pt_scene_t {
     // mapping, so a sync never reallocates and never stages.
     gpu_buffer_t instance_data;
     gpu_buffer_t light_data;
+    // The emissive entities the integrator can sample explicitly, gathered out of the entity
+    // array by every sync. Derived rather than authored: an entity becomes an emitter purely
+    // by having an emission and a shape that can be sampled, so there is nothing to edit and
+    // nothing for a scene file to get out of step with.
+    gpu_buffer_t emitter_data;
+    uint32_t emitter_count;
     gpu_accel_t tlas;
     uint32_t synced_revision;
 } pt_scene_t;

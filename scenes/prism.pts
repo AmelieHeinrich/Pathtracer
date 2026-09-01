@@ -1,0 +1,148 @@
+# pathtracer scene v1
+#
+# Three solids of optical glass, raked by one slab out of frame behind them.
+#
+#   Pathtracer --scene scenes/prism.pts --sky 0 --bounces 16 --samples 4096 --capture prism.png
+#
+# Two of them are dense flint at Abbe 26 and one is crown at Abbe 64, so the colour fringing
+# along their edges and in what they throw is a direct read-out of the one number that differs.
+# Shapes were chosen for what they do to light rather than for variety: the cube stood on edge
+# is a prism and deflects, the sphere is a lens and focuses to a point, the cylinder is a lens
+# in one axis and focuses to a line.
+#
+# Where the focus lands is set by the index alone -- the back focus of a sphere sits
+# n*R/(2(n-1)) from its centre -- which is why there is no diamond here. At 2.417 that figure
+# is 0.77 against a radius of 0.9, so a diamond sphere crosses over *inside itself* and is
+# spreading again by the time the light leaves. It is the most brilliant thing you can put in
+# front of a camera and it casts almost nothing.
+#
+# A caveat worth setting expectations with: the caustics here are subtle, and that is the
+# renderer rather than the scene. A shadow ray passes straight through transmissive geometry by
+# design (see anyhit_shadow_mesh), so glass casts no shadow at all -- the floor under these
+# objects is lit exactly as if they were not there. In life a caustic is bright against the
+# shadow of the thing that made it, and here there is no shadow to be bright against, so it has
+# to compete with fully lit floor. Raking the light across the floor buys some of that contrast
+# back, by cutting the direct lighting with the cosine at the surface while doing nothing to the
+# refracted cone, which is focused and does not care what angle it arrived at. It does not buy
+# all of it. To go further you have to block the direct light with real geometry: an opaque
+# panel between lamp and floor, with the glass sitting in a gap in it, is the setup that gives
+# the textbook picture.
+#
+# The camera is pitched down far enough that the floor fills the frame and the horizon sits at
+# the top edge. That is not framing for its own sake -- it is what makes the scene work. Glass
+# has no appearance of its own: it is only ever a picture of whatever is behind and around it,
+# so a transparent object against a black background is a black object. The lit floor is what
+# the glass has to show, and it is also the surface anything it throws lands on, so pointing
+# the camera at it solves both at once. There is deliberately no back wall.
+#
+# The floor is mid grey rather than white for the same reason: on a white floor there is no
+# headroom left to be brighter with.
+#
+# The lamp is an emissive slab rather than a `light` block, and for the caustics that is not
+# optional. Explicit lights are not in the acceleration structure, so a bounce ray can never
+# find one, and a direct contribution that had to cross glass is dropped rather than trusted --
+# a point or area light gives a lit floor and nothing focused at all. An emissive *instance* is
+# found by BSDF rays, which is the shape of a caustic path: floor, into the glass, out of the
+# glass, into the lamp. That needs four bounces before it reaches anything and more once it
+# starts reflecting internally, hence --bounces 16.
+#
+# It is also the one path next event estimation cannot help with -- the vertex before the light
+# is a delta, so there is no direction to connect toward -- so those paths are found by chance
+# and are much the noisiest thing here. Everything else in the frame is sampled explicitly and
+# settles quickly.
+#
+# If the whole frame comes out too hot or too flat, reach for --exposure before editing any
+# number in here.
+
+camera
+  position 0 3.2 7.2
+  yaw 180
+  pitch -20
+  fov 40
+
+entity "ground"
+  shape       plane
+  translation 0 0 0
+  rotation    0 0 0
+  scale       30 1 30
+  albedo      0.45 0.45 0.47
+  roughness   1
+
+# Dense flint (SF11), stood on one edge -- a unit cube turned 45 degrees about Z is a prism,
+# and its half-diagonal is 1.13, which is where the y translation comes from. Abbe 26 is about
+# as dispersive as ordinary optical glass gets.
+entity "prism"
+  shape        cube
+  translation  0 1.14 0
+  rotation     0 0 45
+  scale        0.8 0.8 0.8
+  albedo       1 1 1
+  roughness    0
+  transmission 1
+  ior          1.785
+  abbe         26
+
+# Dense flint again, as a sphere, because a sphere is a lens and this is the one that throws a
+# real caustic. Where the focus lands is what decides that, and it is set by the index alone:
+# the back focus of a sphere sits n*R/(2(n-1)) from its centre, which for flint at 1.785 is
+# 1.02 against a radius of 0.9 -- just outside the glass, so the cone converges on the floor a
+# little in front of it. Diamond was here first and was a mistake: at 2.417 that same figure is
+# 0.77, *inside* the sphere, so the light has already crossed over and is spreading again by
+# the time it leaves. A diamond sphere is brilliant to look at and casts almost nothing.
+entity "flint sphere"
+  shape        sphere
+  translation  -2.4 0.9 0.3
+  rotation     0 0 0
+  scale        0.9 0.9 0.9
+  albedo       1 1 1
+  roughness    0
+  transmission 1
+  ior          1.785
+  abbe         26
+
+# Crown glass, and a cylinder rather than a sphere: a cylinder is a lens in one axis only, so
+# it focuses to a *line* instead of a point and lays a bright streak across the floor rather
+# than a spot. Abbe 64 against the flint's 26 is the comparison the scene is really for -- same
+# light, same geometry, four times less colour separation in what it throws.
+entity "crown cylinder"
+  shape        cylinder
+  translation  2.4 0.9 0.3
+  rotation     0 0 0
+  scale        0.7 0.9 0.7
+  albedo       1 1 1
+  roughness    0
+  transmission 1
+  ior          1.517
+  abbe         64
+
+# The only light. Behind the group and above it, tilted so its underside faces them, and
+# parked well above the camera's own horizontal -- which at this pitch is the top edge of
+# frame -- so it lights the scene without appearing in it.
+#
+# Behind rather than in front, which is the difference between a picture of some glass and a
+# picture of what glass does: lit from the front, the caustics fall away from the camera and
+# hide behind the objects casting them. Lit from behind they are thrown forward into open
+# floor, and the objects are rimmed and lit through at the same time.
+#
+# Low as well as behind, and that is worth explaining because it costs a lot of brightness --
+# hence the large emission_strength against a slab this size. A shadow ray passes straight
+# through transmissive geometry here by design (see anyhit_shadow_mesh), so glass casts no
+# shadow at all: the floor under these objects is lit exactly as if they were not there, and a
+# caustic has to be bright enough to read on top of that rather than inside a shadow the way
+# it would in life. Raking the light across the floor is what buys the contrast back. It cuts
+# the direct lighting by the cosine at the surface while doing nothing to the refracted cone,
+# which is focused and does not care what angle it arrived at.
+#
+# It also has to stay above the camera's own horizontal, which at this pitch is the top edge of
+# frame -- at 4.2 it clears it, at 3 it does not and the slab appears in shot.
+#
+# Black albedo because it is a lamp, not a lit surface.
+entity "lamp"
+  shape             cube
+  translation       -1 4.2 -6
+  rotation          -61 0 0
+  scale             0.85 0.04 0.85
+  albedo            0 0 0
+  emission          1 0.97 0.92
+  emission_strength 130
+  roughness         1

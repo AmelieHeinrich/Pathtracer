@@ -32,6 +32,12 @@ struct InstanceData {
     // Beer-Lambert: the fraction surviving one unit of travel, already folded from the
     // authored colour and distance by fill_instance.
     float3 attenuation;
+    // The area-measure density with which emitter_lighting would have sampled a point on this
+    // instance, or 0 when it is not an emitter that can be sampled explicitly. Carried here so
+    // a bounce ray that lands on an emitter can weight itself against the explicit strategy
+    // without searching the emitter list. See fill_emitters in src/scene.c.
+    float emitter_pdf_area;
+    float pad;
 };
 
 // Matches pt_camera_t in src/pt_math.h.
@@ -50,11 +56,16 @@ struct Camera {
 
 // `InstanceData*` lowers to a SPIR-V PhysicalStorageBuffer pointer: a real buffer device
 // address, not a descriptor. The scene can grow without touching the descriptor set.
+// Matches the PT_FLAG_* macros in src/renderer.h.
+static const uint PT_FLAG_UNLIT = 1u << 0;
+static const uint PT_FLAG_CLAMP = 1u << 1;
+static const uint PT_FLAG_ADAPTIVE = 1u << 2;
+
 // Matches pt_settings_t in src/renderer.h.
 struct Settings {
     uint max_bounces;
     uint samples_per_frame;
-    uint unlit;
+    uint flags;
     float sky_intensity; // 0 turns the sky off, leaving only the explicit lights
     float turbidity;
     float sun_azimuth;   // degrees
@@ -77,7 +88,8 @@ static const uint LIGHT_AREA = 3u;
 // (see intersect_area_lights), so the panel is visible without a bounce ray ever finding it.
 //
 // A shape that glows is a different thing: an ordinary instance with a non-zero emission,
-// found by BSDF rays alone.
+// which a BSDF ray *can* land on. See Emitter below, which is how those get sampled
+// explicitly, and why they need MIS where these do not.
 struct Light {
     uint type;
     float3 position;
@@ -91,6 +103,25 @@ struct Light {
     float3 edge_u;
     float3 edge_v;
     float area;
+};
+
+// Matches pt_emitter_data_t in src/scene.h. An emissive `plane` or `cube` instance, described
+// as the centre and half-axes the instance transform turns the unit shape into.
+//
+// Unlike a Light, an Emitter *is* in the acceleration structure: it is an ordinary piece of
+// geometry that happens to glow. Both strategies can therefore reach it -- explicitly, by
+// emitter_lighting aiming a shadow ray at it, and by chance, when a BSDF ray lands on it --
+// so unlike the Lights above this one genuinely needs multiple importance sampling to combine
+// them. That is the whole difference between the two tables.
+struct Emitter {
+    float3 center;
+    float3 axis_u;
+    float3 axis_v;
+    float3 axis_w; // zero for a quad, where there is no third extent
+    float3 emission;
+    float area;    // the whole emitting surface: six faces for a box, one for a quad
+    uint instance;
+    uint is_box;
 };
 
 struct PushConstants {
@@ -107,6 +138,9 @@ struct PushConstants {
     // this block sits exactly on the 128 byte guarantee.
     uint frame_index;
     uint light_count;
+    // How much of the emitter table is live. The table is binding 7 rather than a fourth
+    // device address because this block already sits exactly on the 128 byte guarantee.
+    uint emitter_count;
     Settings settings;
 };
 [[vk::push_constant]] PushConstants push;
@@ -134,6 +168,12 @@ struct PushConstants {
 // Two 128x128 blue noise tiles side by side, eight independent channels in all. Read only,
 // uploaded once, and never resized -- see src/bluenoise.c.
 [[vk::binding(6, 0)]] uniform RWTexture2D<float4> bluenoise;
+// The emissive geometry the integrator can aim at. A descriptor rather than a device address
+// purely because the push constant block is full; see PushConstants above.
+[[vk::binding(7, 0)]] uniform StructuredBuffer<Emitter> emitters;
+// Running sum of squared sample magnitude, paired with the sum and count in `accum`. Together
+// they give each pixel its own variance, which is what the adaptive sample budget reads.
+[[vk::binding(8, 0)]] uniform RWTexture2D<float> moment;
 
 // Larger than any TMax the integrator uses, so a line against the sky is never discarded.
 static const float PT_DEPTH_MISS = 1e30f;
@@ -196,11 +236,29 @@ float rand(inout Rng rng)
 // Must match PT_BLUENOISE_TILE in src/bluenoise.h.
 static const uint PT_BN_TILE = 128u;
 
-// The R5 low-discrepancy sequence: alpha_d = frac(phi^-(d+1)) for phi the real root of
-// x^6 = x + 1. Stored as 32 bit fixed point, which is what makes the multiply below exact --
+// The R8 low-discrepancy sequence: alpha_d = frac(phi^-(d+1)) for phi the real root of
+// x^9 = x + 1. Stored as 32 bit fixed point, which is what makes the multiply below exact --
 // see blue_noise.
-static const uint PT_BN_ALPHA[6] = {3785032106u, 3335640776u, 2939605022u,
-                                    2590590015u, 2283013049u, 2011954246u};
+//
+// Eight dimensions rather than the six R5 gave, because the atlas holds eight channels and
+// the last three are what the first bounce's BSDF sample needs. Widening the sequence costs
+// the first five dimensions a little -- a higher rank is very slightly worse per dimension --
+// and buys stratification on the draw that decides where the whole rest of the path goes,
+// which is by far the better trade. See PT_BN_DIM_BSDF.
+static const uint PT_BN_ALPHA[8] = {3958238937u, 3647910312u, 3361911661u, 3098335500u,
+                                    2855423888u, 2631556713u, 2425240876u, 2235100341u};
+// How many dimensions the sequence covers. Past this a sampler falls back to plain PCG.
+static const uint PT_BN_DIMS = 8u;
+// Where the stratified prefix is spent, in the order raygen consumes it.
+static const uint PT_BN_DIM_LAMBDA = 0u; // the hero wavelength
+static const uint PT_BN_DIM_JITTER = 1u; // and 2: the sub-pixel position
+static const uint PT_BN_DIM_LENS = 3u;   // and 4: the point on the aperture
+// And 6, 7. The first bounce's lobe choice and its two direction draws. This is the highest
+// leverage draw in the whole path: at the first surface it decides which way the path leaves,
+// and everything after it -- whether the ray finds the glass, the caustic, the light -- is
+// conditioned on that one choice. Later bounces fall back to PCG, where the extra
+// stratification would be washed out by the branching above them anyway.
+static const uint PT_BN_DIM_BSDF = 5u;
 
 // One sample of the low-dimensional prefix, after Heitz and Belcour's "distributing Monte
 // Carlo errors as a blue noise distribution".
@@ -230,6 +288,31 @@ float blue_noise(uint2 pixel, uint dim, uint sample_index)
     // multiply wraps modulo 2^32, which *is* the fractional part, exactly, forever.
     const uint offset = sample_index * PT_BN_ALPHA[dim];
     return frac(base + float(offset) * (1.0f / 4294967296.0f));
+}
+
+// A source of random numbers that is stratified while it can be and plain PCG once it cannot.
+//
+// The reason this exists rather than every caller reaching for blue_noise directly: the
+// stratified prefix is a fixed, small budget -- eight dimensions -- and which draws get to
+// spend it has to be decided in one place, in the order the path consumes them. A caller
+// takes numbers from `sampler_next` without knowing or caring which half it is getting, and
+// raygen decides by setting `dim` before handing the sampler on.
+//
+// Setting `dim` to PT_BN_DIMS or beyond is the explicit way to say "this one is not worth a
+// stratified dimension", which is what every bounce after the first does.
+struct Sampler {
+    Rng rng;
+    uint2 pixel;
+    uint sample_index;
+    uint dim; // the next stratified dimension to spend, or >= PT_BN_DIMS for none left
+};
+
+float sampler_next(inout Sampler s)
+{
+    if (s.dim < PT_BN_DIMS) {
+        return blue_noise(s.pixel, s.dim++, s.sample_index);
+    }
+    return rand(s.rng);
 }
 
 // A uniform point on the unit disc, by Shirley's concentric mapping. Concentric rather than
@@ -443,6 +526,215 @@ Spectrum direct_lighting(float3 hit_point, Surface surface, float3 wo, Spectrum 
     // physically should.
     const Spectrum f = bsdf_eval(surface, wo, to_light);
     return throughput * f * incident * float(push.light_count);
+}
+
+// ---------------------------------------------------------------------------
+// emissive geometry
+// ---------------------------------------------------------------------------
+
+// One face of an emitter, as a centre, two half-edges and the way it faces. The normal is
+// carried rather than recomputed by the caller because only emitter_face knows which side of
+// the emitter this face came from; see face_normal.
+struct EmitterFace {
+    float3 center;
+    float3 edge0;
+    float3 edge1;
+    float3 normal; // unit, and for a box pointing away from the emitter's centre
+};
+
+// Perpendicular to the face, turned to point away from the emitter's centre -- which for a
+// convex box is outward. `from_center` is the offset from that centre to the face.
+//
+// The turn is the whole reason this is a function. cross(edge0, edge1) is perpendicular to
+// the face, but its sign follows whichever order the two edges were listed in, which has
+// nothing to do with which side of the box is outside; taking it on trust points half the
+// faces of every box inward.
+float3 face_normal(float3 edge0, float3 edge1, float3 from_center)
+{
+    const float3 n = normalize(cross(edge0, edge1));
+    return dot(n, from_center) < 0.0f ? -n : n;
+}
+
+// Picks a face of `e` with probability proportional to its area, and returns it.
+//
+// The area weighting is what makes the density uniform over the whole surface, which is what
+// lets one number per instance stand in for it on the other side. A thin slab is the case
+// that matters: its two broad faces are nearly all of its area and are picked nearly always,
+// while the four edge strips are picked in proportion to how little they contribute.
+EmitterFace emitter_face(Emitter e, float u)
+{
+    EmitterFace face;
+    face.center = e.center;
+    face.edge0 = e.axis_u;
+    face.edge1 = e.axis_v;
+    face.normal = normalize(cross(e.axis_u, e.axis_v));
+
+    if (e.is_box == 0u) {
+        return face; // a plane is its own single face
+    }
+
+    // Face areas, in the same order the branches below take them. The factor of four every
+    // one of them shares is left out: only their ratios are used here.
+    const float a_uv = length(cross(e.axis_u, e.axis_v));
+    const float a_vw = length(cross(e.axis_v, e.axis_w));
+    const float a_wu = length(cross(e.axis_w, e.axis_u));
+    // Each pair of opposite faces has the same area, so a pair is chosen first and then a
+    // side of it -- which costs one draw instead of two and keeps the weighting exact.
+    const float total = 2.0f * (a_uv + a_vw + a_wu);
+    float pick = u * total;
+
+    // The sign folds the "which of the two" choice into the same draw: the leftover after
+    // choosing a pair is uniform on [0, 2a), so its half decides the side.
+    if (pick < 2.0f * a_uv) {
+        const float side = pick < a_uv ? -1.0f : 1.0f;
+        face.center = e.center + e.axis_w * side;
+        face.edge0 = e.axis_u;
+        face.edge1 = e.axis_v;
+        face.normal = face_normal(face.edge0, face.edge1, e.axis_w * side);
+        return face;
+    }
+    pick -= 2.0f * a_uv;
+    if (pick < 2.0f * a_vw) {
+        const float side = pick < a_vw ? -1.0f : 1.0f;
+        face.center = e.center + e.axis_u * side;
+        face.edge0 = e.axis_v;
+        face.edge1 = e.axis_w;
+        face.normal = face_normal(face.edge0, face.edge1, e.axis_u * side);
+        return face;
+    }
+    pick -= 2.0f * a_vw;
+    const float side = pick < a_wu ? -1.0f : 1.0f;
+    face.center = e.center + e.axis_v * side;
+    face.edge0 = e.axis_w;
+    face.edge1 = e.axis_u;
+    face.normal = face_normal(face.edge0, face.edge1, e.axis_v * side);
+    return face;
+}
+
+// The solid angle density of having sampled a point on an emitter, given how far away it is
+// and how it is tilted. `pdf_area` is the instance's own, which fill_emitters made uniform
+// over the whole surface.
+//
+// Two-sided, deliberately: an instance's emission is added whichever face a ray lands on, so
+// the explicit strategy has to be able to reach the same points the BSDF one can. A one-sided
+// test here would silently drop half of them and darken the result.
+float emitter_pdf_solid_angle(float pdf_area, float distance_to_light, float3 to_light,
+                              float3 light_normal)
+{
+    const float cos_light = abs(dot(to_light, light_normal));
+    if (cos_light < 1e-6f) {
+        return 0.0f; // edge on: no projected area, so nothing could have been sampled here
+    }
+    return pdf_area * distance_to_light * distance_to_light / cos_light;
+}
+
+// Emissive geometry, sampled explicitly and MIS-weighted against the BSDF's chance of finding
+// it -- the same arrangement sun_lighting uses, and for the same reason.
+//
+// Without this an emissive slab is found only when a bounce ray happens to land on it, which
+// is how every emissive instance behaved before: usable for a big soft backdrop, hopeless for
+// anything smaller, and the reason a scene lit by nothing else converged so slowly. Aiming at
+// it turns the whole diffuse half of the image into one well-behaved sample per bounce.
+//
+// What this does *not* fix, and cannot: the caustic. The path that carries one is
+// diffuse-then-refract-then-refract-then-light, and the vertex before the light is a delta,
+// so there is no direction to connect toward and nothing for this routine to contribute.
+// Those still arrive only by chance. That is a property of unidirectional path tracing rather
+// than of this implementation -- it takes photon mapping or manifold sampling to do better --
+// and it is why the clamp and the adaptive budget in raygen exist.
+Spectrum emitter_lighting(float3 hit_point, Surface surface, float3 wo, Spectrum throughput,
+                          float4 lambda, inout Rng rng)
+{
+    if (push.emitter_count == 0u) {
+        return Spectrum(0.0f);
+    }
+
+    const uint index = min(uint(rand(rng) * float(push.emitter_count)),
+                           push.emitter_count - 1u);
+    const Emitter emitter = emitters[index];
+
+    const EmitterFace face = emitter_face(emitter, rand(rng));
+    const float u = rand(rng);
+    const float v = rand(rng);
+    const float3 point = face.center + face.edge0 * (u * 2.0f - 1.0f) +
+                         face.edge1 * (v * 2.0f - 1.0f);
+
+    const float3 offset = point - hit_point;
+    const float distance_to_light = length(offset);
+    if (distance_to_light < 1e-5f) {
+        return Spectrum(0.0f);
+    }
+    const float3 to_light = offset / distance_to_light;
+
+    // A box is convex, so a face the shading point sits behind is occluded by the box itself
+    // and the shadow ray below could only ever come back blocked. Skipping it changes no
+    // value -- the contribution is zero either way -- and saves roughly half the shadow rays
+    // a slab would otherwise cast, since one of its two broad faces always points away.
+    if (emitter.is_box != 0u && dot(face.normal, hit_point - face.center) < 0.0f) {
+        return Spectrum(0.0f);
+    }
+
+    // A transmissive surface can be lit from behind; an opaque one cannot, and a shadow ray
+    // toward a light under the horizon is pure waste.
+    const bool two_sided = surface.transmission > 0.0f;
+    if (!two_sided && dot(surface.normal, to_light) <= 0.0f) {
+        return Spectrum(0.0f);
+    }
+
+    const float pdf_light = emitter_pdf_solid_angle(
+        push.instances[emitter.instance].emitter_pdf_area, distance_to_light, to_light,
+        face.normal);
+    if (pdf_light <= 0.0f) {
+        return Spectrum(0.0f);
+    }
+
+    const Spectrum f = bsdf_eval(surface, wo, to_light);
+    if (spectrum_max(f) <= 0.0f) {
+        return Spectrum(0.0f); // a delta lobe, or the wrong side; nothing to weight
+    }
+
+    RayDesc shadow;
+    shadow.Origin = hit_point + (dot(surface.normal, to_light) > 0.0f ? surface.normal
+                                                                     : -surface.normal) *
+                                    0.0005f;
+    shadow.Direction = to_light;
+    shadow.TMin = 0.001f;
+    // Stops just short of the emitter, which unlike a Light is real geometry and would
+    // otherwise block the very ray sent to sample it.
+    //
+    // Scaled by the distance rather than a fixed epsilon, which this was first and which does
+    // not work. A constant 0.001 is a clearance measured along the ray, and what has to clear
+    // is the emitter's *plane*: at twenty units, with the ray arriving nearly edge-on to a
+    // panel, that same 0.001 of ray length is only a couple of ten-thousandths of a unit of
+    // perpendicular gap, and the traversal finds the panel inside TMax. The failure is
+    // distance and angle dependent, so it does not look like an epsilon problem -- it looks
+    // like the far half of the floor being mysteriously unlit while the near half is fine.
+    shadow.TMax = distance_to_light - max(distance_to_light * 1e-3f, 1e-4f);
+
+    ShadowPayload occlusion;
+    occlusion.visible = false;
+    occlusion.crossed_transmissive = false;
+    TraceRay(scene,
+             RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER |
+                 RAY_FLAG_FORCE_NON_OPAQUE,
+             0xFFu, 0, 0, 1, shadow, occlusion);
+
+    if (!occlusion.visible) {
+        return Spectrum(0.0f);
+    }
+    // The same straight-line caveat direct_lighting documents: a transmission lobe aimed
+    // through other glass is not the path the light actually takes.
+    if (occlusion.crossed_transmissive && dot(surface.normal, to_light) < 0.0f) {
+        return Spectrum(0.0f);
+    }
+
+    const float pdf_bsdf = bsdf_pdf(surface, wo, to_light);
+    const float weight = (pdf_light * pdf_light) /
+                         (pdf_light * pdf_light + pdf_bsdf * pdf_bsdf);
+
+    const Spectrum emitted = upsample_emission(push.spectra, emitter.emission,
+                                               illuminant_d65(push.spectra, lambda), lambda);
+    return throughput * f * emitted * (weight / pdf_light);
 }
 
 // The sun, sampled explicitly, MIS-weighted against the BSDF's own chance of finding it.
@@ -669,19 +961,25 @@ Spectrum sky_radiance(float3 dir, float4 lambda)
 // One complete path through the scene, from a jittered point inside `pixel`. The caller
 // takes as many of these per frame as push.settings.samples_per_frame asks for; `rng` is
 // carried across them so successive samples do not repeat one another.
-float3 trace_sample(uint2 pixel, uint2 size, uint sample_index, inout Rng rng,
+float3 trace_sample(uint2 pixel, uint2 size, uint sample_index, inout Sampler sampler,
                     out float primary_t, out uint primary_instance, out float3 primary_normal)
 {
     primary_t = PT_DEPTH_MISS;
     primary_instance = 0u; // 0 means nothing was hit
     primary_normal = float3(0.0f, 1.0f, 0.0f); // replaced below on the first bounce
 
+    // Kept in step here rather than at the call site. The stratified draws this function makes
+    // directly and the ones bsdf_sample makes through the sampler have to be reading the same
+    // point of the same sequence, and setting both in one place is what guarantees it.
+    sampler.pixel = pixel;
+    sampler.sample_index = sample_index;
+
     // One hero wavelength for the whole path, drawn before the first ray. Every spectral
     // quantity below is sampled at exactly these four, and they are resolved to a colour once,
     // at the very end -- never per bounce.
     // Dimension 0. The hero wavelength decides the whole path's spectrum, so stratifying it
     // across the image is what stops the spectral noise from clumping into colour blotches.
-    const float4 lambda = hero_wavelengths(blue_noise(pixel, 0u, sample_index));
+    const float4 lambda = hero_wavelengths(blue_noise(pixel, PT_BN_DIM_LAMBDA, sample_index));
     // Not const: a dispersive refraction narrows this to the hero wavelength alone.
     float4 lambda_pdf = float4(PT_LAMBDA_PDF);
 
@@ -689,8 +987,8 @@ float3 trace_sample(uint2 pixel, uint2 size, uint sample_index, inout Rng rng,
     //
     // Dimensions 1 and 2. Named rather than written inline, because evaluation order within
     // an expression is unspecified and these two are not interchangeable.
-    const float jitter_x = blue_noise(pixel, 1u, sample_index);
-    const float jitter_y = blue_noise(pixel, 2u, sample_index);
+    const float jitter_x = blue_noise(pixel, PT_BN_DIM_JITTER, sample_index);
+    const float jitter_y = blue_noise(pixel, PT_BN_DIM_JITTER + 1u, sample_index);
     float2 ndc = (float2(pixel) + float2(jitter_x, jitter_y)) / float2(size) * 2.0f - 1.0f;
     // The aspect ratio is the dispatch's own, which is what the CPU used to send down.
     ndc.x *= float(size.x) / float(size.y);
@@ -715,8 +1013,8 @@ float3 trace_sample(uint2 pixel, uint2 size, uint sample_index, inout Rng rng,
         // Dimensions 3 and 4. The lens is where blue noise pays off most visibly: a bokeh
         // disc is a wide, low-frequency blur, so unstratified lens samples read as mottling
         // across the whole out-of-focus region rather than as fine grain.
-        const float lens_u = blue_noise(pixel, 3u, sample_index);
-        const float lens_v = blue_noise(pixel, 4u, sample_index);
+        const float lens_u = blue_noise(pixel, PT_BN_DIM_LENS, sample_index);
+        const float lens_v = blue_noise(pixel, PT_BN_DIM_LENS + 1u, sample_index);
         const float2 lens = concentric_disc(lens_u, lens_v) * camera.aperture;
 
         const float3 focal_point = camera.position + direction * camera.focus_distance;
@@ -815,7 +1113,7 @@ float3 trace_sample(uint2 pixel, uint2 size, uint sample_index, inout Rng rng,
         // Still routed through the spectral path rather than short circuited to RGB, which
         // makes this view a free and very sharp check on the upsampling: an albedo upsampled
         // under D65 and resolved back must give the colour that was authored.
-        if (push.settings.unlit != 0u) {
+        if ((push.settings.flags & PT_FLAG_UNLIT) != 0u) {
             const Spectrum illuminant = illuminant_d65(push.spectra, lambda);
             radiance = payload.hit_t < 0.0f
                            ? sky_radiance(ray.Direction, lambda)
@@ -849,14 +1147,32 @@ float3 trace_sample(uint2 pixel, uint2 size, uint sample_index, inout Rng rng,
             break;
         }
 
-        // A surface's own glow. An emitter, so it upsamples against the illuminant rather
-        // than as a reflectance.
-        radiance += throughput * upsample_emission(push.spectra, payload.emission,
-                                                   illuminant_d65(push.spectra, lambda),
-                                                   lambda);
-
         const float3 hit_point = ray.Origin + ray.Direction * payload.hit_t;
         const InstanceData material = push.instances[payload.instance];
+
+        // A surface's own glow. An emitter, so it upsamples against the illuminant rather
+        // than as a reflectance.
+        //
+        // Weighted against emitter_lighting, which may have been able to aim at this very
+        // surface from the previous vertex. The weight is 1 in the two cases where it could
+        // not: a camera ray, and a delta bounce, neither of which has a density for the
+        // explicit strategy to compete with. It is also 1 for an emitter this renderer cannot
+        // sample explicitly -- a glowing sphere or mesh -- whose emitter_pdf_area is 0, which
+        // is exactly the old behaviour for exactly the shapes that kept it.
+        if (max(max(payload.emission.x, payload.emission.y), payload.emission.z) > 0.0f) {
+            float weight = 1.0f;
+            if (!prev_specular && material.emitter_pdf_area > 0.0f) {
+                const float pdf_light = emitter_pdf_solid_angle(
+                    material.emitter_pdf_area, payload.hit_t, ray.Direction, payload.normal);
+                if (pdf_light > 0.0f) {
+                    weight = (prev_bsdf_pdf * prev_bsdf_pdf) /
+                             (prev_bsdf_pdf * prev_bsdf_pdf + pdf_light * pdf_light);
+                }
+            }
+            radiance += throughput * weight *
+                        upsample_emission(push.spectra, payload.emission,
+                                          illuminant_d65(push.spectra, lambda), lambda);
+        }
 
         // The bit fill_surface deliberately preserved. Everything downstream wants a normal
         // facing the ray, so it is oriented here -- once, where the ray direction is in scope.
@@ -876,10 +1192,14 @@ float3 trace_sample(uint2 pixel, uint2 size, uint sample_index, inout Rng rng,
 
         // Explicit light sampling, before the throughput is updated below -- the BSDF
         // evaluated inside carries the surface's own reflectance.
-        radiance += direct_lighting(hit_point, surface, wo, throughput, lambda, rng);
-        radiance += sun_lighting(hit_point, surface, wo, throughput, lambda, rng);
+        radiance += direct_lighting(hit_point, surface, wo, throughput, lambda, sampler.rng);
+        radiance += emitter_lighting(hit_point, surface, wo, throughput, lambda, sampler.rng);
+        radiance += sun_lighting(hit_point, surface, wo, throughput, lambda, sampler.rng);
 
-        const BsdfSample bsdf = bsdf_sample(surface, wo, rng);
+        // The first bounce spends the last three stratified dimensions; every one after it
+        // takes plain PCG. See PT_BN_DIM_BSDF for why this draw and not another.
+        sampler.dim = bounce == 0u ? PT_BN_DIM_BSDF : PT_BN_DIMS;
+        const BsdfSample bsdf = bsdf_sample(surface, wo, sampler);
         if (spectrum_max(bsdf.weight) <= 0.0f) {
             break; // the lobe sampled into the surface, so the path ends here
         }
@@ -919,9 +1239,20 @@ float3 trace_sample(uint2 pixel, uint2 size, uint sample_index, inout Rng rng,
 
         // Russian roulette, once a path is long enough that the bias-free early exit is
         // worth the added variance.
-        if (bounce >= 2u) {
-            const float survive = clamp(spectrum_max(throughput), 0.02f, 1.0f);
-            if (rand(rng) > survive) {
+        //
+        // Not applied to a path that just left a delta lobe. Those are the caustic carriers:
+        // they are still inside a chain of refractions with nothing to show for it yet, and
+        // killing one there throws away the only route the renderer has to a caustic. The
+        // chain is bounded by max_bounces regardless, so nothing runs away.
+        //
+        // The survival floor is 0.05 rather than 0.02 because the divide below is an
+        // amplifier: a path scraping along at the floor has its contribution multiplied by
+        // one over it, so 0.02 turns whatever it finds into a fifty-fold spike. The higher
+        // floor keeps a few more low-throughput paths alive and costs a little tracing, in
+        // exchange for the worst class of firefly this integrator produces.
+        if (bounce >= 2u && !bsdf.specular) {
+            const float survive = clamp(spectrum_max(throughput), 0.05f, 1.0f);
+            if (rand(sampler.rng) > survive) {
                 break;
             }
             throughput /= survive;
@@ -934,21 +1265,144 @@ float3 trace_sample(uint2 pixel, uint2 size, uint sample_index, inout Rng rng,
     return spectral_resolve(push.spectra, lambda, radiance, lambda_pdf);
 }
 
+// ---------------------------------------------------------------------------
+// accumulation
+// ---------------------------------------------------------------------------
+
+// How bright one sample is, for the clamp and the variance estimate below.
+//
+// The largest component, deliberately, and *not* a luma. A luma weights green about ten times
+// more heavily than blue, which is right for a picture and badly wrong for a sample out of
+// this integrator. A dispersive path collapses to a single hero wavelength and spectral_resolve
+// scales what survives back up, so each one arrives as a bright, almost fully saturated
+// colour -- a green sample here, a blue one there, integrating to white only in the average.
+// Judged by luma, the green ones measure ten times the magnitude of the blue ones carrying the
+// same energy, so a clamp keyed to it holds green back hardest and the caustic converges to
+// magenta. The maximum component treats every hero wavelength alike, which is the only thing
+// that makes this comparison mean anything on a spectral render.
+float sample_magnitude(float3 c)
+{
+    return max(max(c.r, c.g), c.b);
+}
+
+// How bright a single sample is allowed to be before it is held back, as a multiple of what
+// the pixel already looks like.
+//
+// This is the answer to the one failure mode a progressive renderer cannot average away on
+// its own. A caustic path is found by chance -- see the note on emitter_lighting -- so it
+// arrives as one sample carrying thousands of times the pixel's mean, and it takes thousands
+// of frames for the average to absorb it. Until then it is a white speck, and a picture full
+// of them looks worse at 4096 samples than the same picture would at 256 with the spikes held
+// down.
+//
+// The bound grows with the square root of the sample count, and that growth is the whole
+// point: a fixed clamp is what most renderers ship, and it permanently eats the energy a
+// caustic is made of, so the image converges to something dimmer than the truth. This one
+// widens without limit, so every finite sample value is eventually admitted and the estimator
+// stays consistent -- it is early frames that are biased, deliberately, and the bias decays.
+//
+// The floor matters as much as the scale. A pixel that is black so far would otherwise have a
+// threshold of zero, clamp away the first real contribution it ever receives, and stay black
+// for good -- the mean can never rise if nothing is allowed to raise it. Adding a constant
+// before scaling gives a dark pixel room to discover it has something in it.
+static const float PT_CLAMP_FLOOR = 0.1f;
+static const float PT_CLAMP_SCALE = 2.0f;
+
+float clamp_threshold(float mean_luma, float count)
+{
+    return (mean_luma + PT_CLAMP_FLOOR) * PT_CLAMP_SCALE * (1.0f + sqrt(count));
+}
+
+// Scaled rather than truncated, so a clamped sample keeps its hue and only loses brightness.
+float3 clamp_sample(float3 radiance, float threshold)
+{
+    const float magnitude = sample_magnitude(radiance);
+    return magnitude > threshold ? radiance * (threshold / magnitude) : radiance;
+}
+
+// Samples a pixel has to have before its own variance is worth believing. Below this the
+// second moment is dominated by how few samples went into it rather than by the scene.
+static const float PT_ADAPTIVE_WARMUP = 16.0f;
+// The relative standard error a pixel is considered settled at. 1.5% is well below what the
+// eye picks out of a smooth gradient, which is where residual noise shows worst.
+static const float PT_ADAPTIVE_TARGET = 0.015f;
+// Even a settled pixel takes a sample this often. Without it a pixel whose true value is
+// carried entirely by rare bright paths could measure zero variance before ever finding one,
+// be marked converged, and never look again -- the estimator would stop being consistent for
+// exactly the pixels that need it most. This bounds how long any pixel can go unsampled, so
+// every count still grows without bound.
+static const uint PT_ADAPTIVE_REVISIT = 8u;
+
+// How many samples this pixel gets this frame, given what it already knows about itself.
+//
+// Purely temporal: it decides how much work a pixel gets, never which pixels it is averaged
+// with. Nothing here reads a neighbour, so unlike the a-trous filter it cannot blur an edge
+// or invent detail -- a skipped pixel simply keeps the average it already had.
+uint adaptive_samples(uint budget, float3 sum, float sum_sq, float count)
+{
+    if (count < PT_ADAPTIVE_WARMUP) {
+        return budget;
+    }
+
+    const float mean = sample_magnitude(sum) / count;
+    // The variance of a single sample, then of their mean. Written this way rather than as a
+    // running variance because the two sums are what the accumulator already has to carry.
+    const float variance = max(sum_sq / count - mean * mean, 0.0f);
+    const float standard_error = sqrt(variance / count);
+    const float relative = standard_error / max(mean, 1e-4f);
+
+    if (relative > PT_ADAPTIVE_TARGET * 3.0f) {
+        return budget * 2u; // still visibly noisy: worth twice the work
+    }
+    if (relative < PT_ADAPTIVE_TARGET) {
+        // Settled. Skip it, but not forever -- see PT_ADAPTIVE_REVISIT.
+        return (push.frame_index % PT_ADAPTIVE_REVISIT) == 0u ? budget : 0u;
+    }
+    return budget;
+}
+
 [shader("raygeneration")]
 void raygen()
 {
     const uint2 pixel = DispatchRaysIndex().xy;
     const uint2 size = DispatchRaysDimensions().xy;
 
-    Rng rng;
-    rng.state = pcg_hash(pixel.x + pixel.y * size.x + pcg_hash(push.frame_index));
+    Sampler sampler;
+    sampler.rng.state = pcg_hash(pixel.x + pixel.y * size.x + pcg_hash(push.frame_index));
+    sampler.pixel = pixel;
+    sampler.sample_index = 0u;
+    sampler.dim = PT_BN_DIMS;
 
-    // Clamped rather than trusted: a zero would divide the accumulator by zero below.
-    const uint samples = max(push.settings.samples_per_frame, 1u);
+    // Testing frame_index == 0 is what stands in for ever clearing the three accumulators.
+    // Written as a branch rather than a ternary on the loads, because on a restart the images
+    // may not even be in a defined layout yet and must not be read at all.
+    const bool restart = push.frame_index == 0u;
+    float3 sum = float3(0.0f);
+    float sum_sq = 0.0f;
+    float count = 0.0f;
+    if (!restart) {
+        const float4 history = accum[pixel];
+        sum = history.rgb;
+        sum_sq = moment[pixel];
+        // Alpha carries the count because with an adaptive budget it is no longer the same
+        // for every pixel, so it cannot be derived from the frame index any more.
+        count = history.a;
+    }
 
-    float3 radiance = float3(0.0f);
-    // Written from the first sample only: every sample lands in the same pixel, so any one of
-    // them describes the geometry there, and the debug pass wants one number, not an average.
+    // Clamped rather than trusted: a zero would leave the accumulator with nothing to divide.
+    const uint budget = max(push.settings.samples_per_frame, 1u);
+    const uint samples = (push.settings.flags & PT_FLAG_ADAPTIVE) != 0u
+                             ? adaptive_samples(budget, sum, sum_sq, count)
+                             : budget;
+
+    const float threshold =
+        (push.settings.flags & PT_FLAG_CLAMP) != 0u && count > 0.0f
+            ? clamp_threshold(sample_magnitude(sum) / count, count)
+            : 1e30f; // no history to judge against, so nothing to hold back
+
+    // Written from the first sample of the frame only: every sample lands in the same pixel,
+    // so any one of them describes the geometry there, and the debug pass wants one number
+    // rather than an average.
     float primary_t = PT_DEPTH_MISS;
     uint primary_instance = 0u;
     float3 primary_normal = float3(0.0f, 1.0f, 0.0f);
@@ -956,27 +1410,37 @@ void raygen()
         float sample_t;
         uint sample_instance;
         float3 sample_normal;
-        // The global sample index, not the loop counter: the sequence has to keep advancing
-        // across frames, which is the whole reason the accumulation converges.
-        const uint sample_index = push.frame_index * samples + sample;
-        radiance += trace_sample(pixel, size, sample_index, rng, sample_t, sample_instance,
-                                 sample_normal);
+        // The pixel's own running count, not a global frame formula. Every pixel therefore
+        // walks its own sequence from wherever it has got to, which is what keeps the
+        // stratification intact now that two pixels can be at different sample counts.
+        const uint sample_index = uint(count) + sample;
+        const float3 radiance = clamp_sample(
+            trace_sample(pixel, size, sample_index, sampler, sample_t, sample_instance,
+                         sample_normal),
+            threshold);
+        sum += radiance;
+        sum_sq += sample_magnitude(radiance) * sample_magnitude(radiance);
         if (sample == 0u) {
             primary_t = sample_t;
             primary_instance = sample_instance;
             primary_normal = sample_normal;
         }
     }
-    depth[pixel] = primary_t;
-    pick[pixel] = primary_instance;
-    normal_buffer[pixel] = float4(primary_normal, 0.0f);
+    count += float(samples);
 
-    // Testing frame_index == 0 is what stands in for ever clearing the accumulation image.
-    // The accumulator holds a sum, so the divisor is the total number of samples that went
-    // into it, not the number of frames.
-    const float3 total = push.frame_index == 0u ? radiance : accum[pixel].rgb + radiance;
-    accum[pixel] = float4(total, 1.0f);
-    output[pixel] = float4(total / float((push.frame_index + 1u) * samples), 1.0f);
+    // Only when this frame actually traced. A skipped pixel keeps the geometry it already
+    // wrote, which is exactly right: any camera or scene change restarts the accumulation,
+    // and a restart traces every pixel. The barrier in renderer_record preserves these three
+    // across frames for this reason.
+    if (samples > 0u) {
+        depth[pixel] = primary_t;
+        pick[pixel] = primary_instance;
+        normal_buffer[pixel] = float4(primary_normal, 0.0f);
+    }
+
+    accum[pixel] = float4(sum, count);
+    moment[pixel] = sum_sq;
+    output[pixel] = float4(sum / max(count, 1.0f), 1.0f);
 }
 
 [shader("miss")]

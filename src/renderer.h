@@ -6,14 +6,29 @@
 #include "scene.h"
 #include "tonemap.h"
 
+// Show albedo straight out of the first hit, with no light transport at all.
+#define PT_FLAG_UNLIT (1u << 0)
+// Progressive firefly clamping. Bounds how far above a pixel's running mean a single sample
+// is allowed to land, with the bound widening as the sample count grows -- so the spikes that
+// dominate an early frame are held back while the estimator stays consistent. See
+// clamp_threshold in shaders/pathtracer.slang.
+#define PT_FLAG_CLAMP (1u << 1)
+// Spend samples where the variance is, rather than evenly. Purely temporal: it changes how
+// many samples a pixel gets, never which pixels it is averaged with.
+#define PT_FLAG_ADAPTIVE (1u << 2)
+
 // The tunables the overlay drives. Every member is 4 bytes on purpose: renderer_record
 // detects a change with a bytewise compare, which padding would make unreliable.
 typedef struct pt_settings_t {
     uint32_t max_bounces;
     // Samples taken per pixel per frame. Accumulation across frames converges on its own, so
-    // this only trades frame rate for how fast a still image settles.
+    // this only trades frame rate for how fast a still image settles. With PT_FLAG_ADAPTIVE
+    // on this is the budget a *converging* pixel gets; a settled one takes none and a noisy
+    // one takes more.
     uint32_t samples_per_frame;
-    uint32_t unlit; // non-zero: show albedo straight out of the first hit, no lighting
+    // The PT_FLAG_* bits above. One field rather than three, because push constants are
+    // already at the 128 byte guarantee -- see PT_PUSH_CONSTANT_LIMIT below.
+    uint32_t flags;
     // Scales the sky the miss shader returns. 0 turns it off entirely, leaving only the
     // explicit lights -- which is what you want to judge a lighting setup on its own.
     float sky_intensity;
@@ -51,6 +66,10 @@ typedef struct pt_push_constants_t {
     // below, which this block now sits exactly on.
     uint32_t frame_index;
     uint32_t light_count;
+    // How many entries of the emitter table are live. The table itself is a descriptor rather
+    // than a fourth device address precisely because this block has no room for one: it sits
+    // exactly on the 128 byte guarantee as it is.
+    uint32_t emitter_count;
     pt_settings_t settings;
 } pt_push_constants_t;
 
@@ -72,9 +91,14 @@ typedef struct renderer_t {
     // Ray tracing target. Linear float, because the sRGB swapchain cannot take STORAGE
     // usage; the blit into it performs the encode.
     gpu_image_t output;
-    // Running sum of radiance across every frame since the last reset. Full float, because
-    // it has to keep adding samples without losing the small ones.
+    // Running sum of radiance across every frame since the last reset, with the number of
+    // samples that went into it in alpha. Full float, because it has to keep adding samples
+    // without losing the small ones -- and because with adaptive sampling the count is no
+    // longer the same for every pixel, so it has to be stored rather than derived.
     gpu_image_t accum;
+    // Running sum of squared sample magnitude, the second moment that turns `accum` into a
+    // per-pixel variance estimate. Read and written by raygen alone.
+    gpu_image_t moment;
     // Distance from the camera to the primary hit, written once per frame regardless of the
     // sample count. Only the debug lines read it, to hide themselves behind scene geometry.
     gpu_image_t depth;
