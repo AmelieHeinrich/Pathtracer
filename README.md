@@ -81,7 +81,7 @@ reflections.
 | ![Glass dragon in a coloured box](.github/screenshot_0006.png) | ![Jade dragon in a coloured box](.github/screenshot_0007.png) |
 | The same mesh as transmissive glass, picking up the walls around it. | And opaque, for comparison — the box and the light are unchanged. |
 | ![Meshes under the sky](.github/screenshot_0004.png) | ![Conductors and glass under coloured light](.github/screenshot_0009.png) |
-| Baked meshes under the Preetham sky, with clear spheres acting as lenses. | The banner scene again, exposed down: chrome, gold and glass under three coloured lights. |
+| Baked meshes under the Preetham sky, with clear spheres acting as lenses. | The banner scene again, Cornell box as mirrors and ground slightly rough. |
 
 ## Building
 
